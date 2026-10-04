@@ -18,17 +18,16 @@ func buildChain(depth int) (context.Context, *ResourceKey[string]) {
 	// Build the chain iteratively to avoid recursive closure overhead.
 	// We seed the first level with rootKey so Use(rootKey) always requires a
 	// full traversal to the bottom when seeking from the top.
-	ctx := ProvideAll(context.Background(), []Provider{
-		Value(rootKey, "root-value"),
-	}, func(c context.Context) context.Context { return c })
 
-	for i := 1; i < depth; i++ {
-		ctx = ProvideAll(ctx, []Provider{
-			Value(fillerKey, i),
-		}, func(c context.Context) context.Context { return c })
+	providers := []Provider{
+		Value(rootKey, "root-value"),
 	}
 
-	return ctx, rootKey
+	for i := 1; i < depth; i++ {
+		providers = append(providers, Value(fillerKey, i))
+	}
+
+	return WithProviders(context.Background(), providers), rootKey
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -112,7 +111,7 @@ func BenchmarkProvideAll_Depth1(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		ProvideAll(ctx, []Provider{Value(key, "v")}, func(c context.Context) context.Context { return c })
+		WithProviders(ctx, []Provider{Value(key, "v")})
 	}
 }
 
@@ -122,7 +121,7 @@ func BenchmarkProvideAll_Depth100(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		ProvideAll(ctx, []Provider{Value(key, "v")}, func(c context.Context) context.Context { return c })
+		WithProviders(ctx, []Provider{Value(key, "v")})
 	}
 }
 
@@ -193,7 +192,7 @@ func BenchmarkVsStdlib_stdlib_Depth1(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		ctx.Value(key)
+		_ = ctx.Value(key)
 	}
 }
 
@@ -211,7 +210,7 @@ func BenchmarkVsStdlib_stdlib_Depth10(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		ctx.Value(key)
+		_ = ctx.Value(key)
 	}
 }
 
@@ -238,12 +237,12 @@ func BenchmarkVsStdlib_stdlib_Depth100(b *testing.B) {
 // The stdlib side is expected to allocate and grow O(providers), while the
 // plocal side stays flat.
 func BenchmarkVsStdlib_plocal_ScopeCreation_Depth1(b *testing.B) {
-	ctx, _ := buildChain(1)
+	ctx := context.Background()
 	key := NewResourceKey[string]("")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		ProvideAll(ctx, []Provider{Value(key, "v")}, func(c context.Context) context.Context { return c })
+		WithProviders(ctx, []Provider{Value(key, "v")})
 	}
 }
 
