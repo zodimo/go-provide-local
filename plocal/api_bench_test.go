@@ -34,27 +34,40 @@ func buildChain(depth int) (context.Context, *ResourceKey[string]) {
 // ─────────────────────────────────────────────────────────────────────────────
 // §3 Performance Benchmarks
 //
-// Measured baseline (Intel Core Ultra 9 185H, Go 1.24, linux/amd64):
+// Measured baseline (Intel Core Ultra 9 185H, Go 1.27, linux/amd64, GOMAXPROCS=22),
+// regenerated with `make bench-mem` (5s/bench):
 //
-//   BenchmarkUse_Depth1-22                →   11 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_Depth10-22               →   56 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_Depth100-22              →  524 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_Depth1-22                       →    26 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_Depth10-22                      →   132 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_Depth100-22                     →  1213 ns/op    0 B/op   0 allocs/op
 //
-//   BenchmarkProvideAll_Depth1-22         →  209 ns/op  440 B/op   6 allocs/op
-//   BenchmarkProvideAll_Depth100-22       →  197 ns/op  440 B/op   6 allocs/op
+//   BenchmarkProvideAll_Depth1-22                →   340 ns/op  440 B/op   6 allocs/op
+//   BenchmarkProvideAll_Depth100-22              →   345 ns/op  440 B/op   6 allocs/op
 //   (identical alloc counts prove scope creation cost is depth-independent)
 //
-//   BenchmarkUse_DepthScaling_1-22        →   12 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_DepthScaling_10-22       →   58 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_DepthScaling_100-22      →  557 ns/op    0 B/op   0 allocs/op
-//   (10x depth ≈ 5x time — O(depth), linear growth confirmed)
+//   BenchmarkUse_DepthScaling_1-22               →    27 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_DepthScaling_10-22              →   132 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_DepthScaling_100-22             →  1200 ns/op    0 B/op   0 allocs/op
+//   (10x depth ≈ 10x time — O(depth), linear growth confirmed)
 //
-//   BenchmarkVsStdlib_plocal_Depth10-22   →   58 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_stdlib_Depth10-22   →   29 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_plocal_Depth1-22           →    26 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth1-22           →     8 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_plocal_Depth10-22          →   132 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth10-22          →    53 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_plocal_Depth100-22         →  1170 ns/op    0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth100-22         →   441 ns/op    0 B/op   0 allocs/op
 //
-// NOTE: For a worst-case single-key lookup at shallow depth, stdlib context.Value
-// is ~2x faster per step. Each plocal step involves a map[any]any lookup; each
-// stdlib step is a pointer comparison + type switch. plocal's advantages are:
+//   BenchmarkVsStdlib_plocal_ScopeCreation_Depth1-22  →  343 ns/op  440 B/op   6 allocs/op
+//   BenchmarkVsStdlib_stdlib_ScopeCreation_Depth1-22  →   39 ns/op   48 B/op   1 allocs/op
+//   (1 provider each; the plocal side stays flat as providers grow, the stdlib
+//    side adds one allocation per wrap)
+//
+// NOTE: Absolute ns/op varies with machine and thermal state; treat the ratios
+// within a single run as the load-bearing evidence and the absolute figures as
+// advisory. For a worst-case single-key lookup, stdlib context.Value is faster
+// per step — ~3x at depth 1, ~2.5x at depth 10, ~2.7x at depth 100. Each plocal
+// step is a map[any]any probe; each stdlib step is a pointer comparison + type
+// switch. plocal's advantages are:
 //   1. Zero heap allocations on Use() at any depth.
 //   2. Scope creation cost is O(providers), not O(depth) — ProvideAll with N
 //      keys creates exactly 1 node instead of N context.WithValue wraps.
@@ -142,14 +155,21 @@ func BenchmarkUse_DepthScaling_100(b *testing.B) {
 	}
 }
 
-// 3.7 Direct comparison: plocal Use() vs stdlib context.Value() at depth 10.
+// 3.7 Direct comparison: plocal Use() vs stdlib context.Value() at depths
+// 1, 10, and 100, plus scope creation at depth 1.
 //
-// Stdlib chain: 10 context.WithValue nodes, each wrapping the previous.
-// The value is stored at the bottom and retrieved from the top, requiring
-// full traversal through Go's interface-based linked list.
+// In both implementations the sought key lives in the root (outermost) node
+// and all remaining levels are fillers, so the two benchmarks in a pair
+// traverse exactly the same distance.
 
+// stdlibKey is a comparable struct used as a context key in the stdlib chain.
+// Struct keys avoid the lint warning for built-in types as map keys while
+// staying allocation-free.
 type stdlibKey struct{ id int }
 
+// buildStdlibChain builds a chain of `depth` nested context.WithValue nodes,
+// storing the sought value in the root (outermost) node and fillers below it.
+// It mirrors buildChain so the two chains are shape-equivalent.
 func buildStdlibChain(depth int) (context.Context, stdlibKey) {
 	rootKey := stdlibKey{id: 0}
 	ctx := context.WithValue(context.Background(), rootKey, "root-value")
@@ -157,6 +177,24 @@ func buildStdlibChain(depth int) (context.Context, stdlibKey) {
 		ctx = context.WithValue(ctx, stdlibKey{id: i}, i)
 	}
 	return ctx, rootKey
+}
+
+func BenchmarkVsStdlib_plocal_Depth1(b *testing.B) {
+	ctx, key := buildChain(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = Use(ctx, key)
+	}
+}
+
+func BenchmarkVsStdlib_stdlib_Depth1(b *testing.B) {
+	ctx, key := buildStdlibChain(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ctx.Value(key)
+	}
 }
 
 func BenchmarkVsStdlib_plocal_Depth10(b *testing.B) {
@@ -173,6 +211,48 @@ func BenchmarkVsStdlib_stdlib_Depth10(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		_ = ctx.Value(key)
+		ctx.Value(key)
+	}
+}
+
+func BenchmarkVsStdlib_plocal_Depth100(b *testing.B) {
+	ctx, key := buildChain(100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = Use(ctx, key)
+	}
+}
+
+func BenchmarkVsStdlib_stdlib_Depth100(b *testing.B) {
+	ctx, key := buildStdlibChain(100)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ctx.Value(key)
+	}
+}
+
+// 3.8 Scope-creation comparison at depth 1: plocal ProvideAll (one registry
+// node holding N providers) vs N sequential stdlib context.WithValue wraps.
+// The stdlib side is expected to allocate and grow O(providers), while the
+// plocal side stays flat.
+func BenchmarkVsStdlib_plocal_ScopeCreation_Depth1(b *testing.B) {
+	ctx, _ := buildChain(1)
+	key := NewResourceKey[string]("")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ProvideAll(ctx, []Provider{Value(key, "v")}, func(c context.Context) context.Context { return c })
+	}
+}
+
+func BenchmarkVsStdlib_stdlib_ScopeCreation_Depth1(b *testing.B) {
+	ctx := context.Background()
+	key := stdlibKey{id: 0}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		_ = context.WithValue(ctx, key, "v")
 	}
 }

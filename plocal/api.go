@@ -21,6 +21,7 @@ type Provider interface {
 //	p := plocal.Value(ThemeKey, DarkTheme)
 //	plocal.ProvideAll(ctx, []plocal.Provider{p}, func(ctx context.Context) { ... })
 func Value[T any](key *ResourceKey[T], val T) Provider {
+
 	return providerImpl[T]{
 		key: key,
 		val: val,
@@ -96,6 +97,9 @@ func Provide[T, U any](c context.Context, key *ResourceKey[T], val T, consumer f
 //
 //	theme := plocal.Use(ctx, ThemeKey) // type: Theme — no assertion needed
 func Use[T any](c context.Context, key *ResourceKey[T]) T {
+	if c == nil {
+		return key.Default()
+	}
 
 	// Find the leaf node in the standard context
 	if node, ok := c.Value(registryKey).(*registryNode); ok {
@@ -108,5 +112,33 @@ func Use[T any](c context.Context, key *ResourceKey[T]) T {
 		}
 	}
 
-	return key.Default
+	return key.Default()
+}
+
+func WithProvider[T any](c context.Context, key *ResourceKey[T], val T) context.Context {
+	return WithProviders(c, []Provider{Value(key, val)})
+}
+
+func WithProviders(c context.Context, providers []Provider) context.Context {
+
+	// Create a map just for the new providers at this level
+	localVals := make(map[any]any, len(providers))
+	for _, p := range providers {
+		p.apply(localVals)
+	}
+
+	// Create the new tree node
+	node := &registryNode{
+		values: localVals,
+	}
+
+	// If a parent node exists, link to it (The Prototype Chain)
+	if parentNode, ok := c.Value(registryKey).(*registryNode); ok {
+		node.parent = parentNode
+	}
+
+	// Wrap the context once with our new leaf node
+	localCtx := context.WithValue(c, registryKey, node)
+
+	return localCtx
 }

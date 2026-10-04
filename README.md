@@ -174,9 +174,19 @@ A convenience wrapper for injecting a single value into a new scope.
 
 Injects multiple providers into the context simultaneously. This creates a single new node in the Registry Tree pointing to the parent scope. Highly optimized for rapid scope creation without map-copying allocations.
 
+### `WithProvider[T any](ctx context.Context, key *ResourceKey[T], val T) context.Context`
+
+Injects a single key/value pair and returns the enriched `context.Context` directly. Unlike `Provide`, it does not take a consumer closure — the caller owns the returned context.
+
+### `WithProviders(ctx context.Context, providers []Provider) context.Context`
+
+Injects multiple providers at once and returns the enriched `context.Context` directly, creating one Registry Tree node for the whole batch.
+
 ### `Use[T any](ctx context.Context, key *ResourceKey[T]) T`
 
 Retrieves the typed value from the nearest node in the registry tree. Returns the key's default fallback value if the key does not exist in the prototype chain.
+
+> **Closure-scoped vs derived-context injection.** `Provide`/`ProvideAll` take a consumer closure and **auto-release the scope** when that closure returns — the enriched context can never outlive it. `WithProvider`/`WithProviders` return a derived `context.Context` whose lifetime is the **caller's responsibility**. Use the closure form for strictly lexical scopes; use `WithProvider`/`WithProviders` when the enriched context must escape the point where it is built (for example, stashing a provider on a request context that a host framework hands to arbitrary downstream code).
 
 ## Ideal Use Cases
 
@@ -189,6 +199,36 @@ Retrieves the typed value from the nearest node in the registry tree. Returns th
 🟢 **Contextual Logging/Tracing:** Passing trace spans or logger instances decorated with request-scoped fields.
 
 **Anti-Pattern Warning:** Do not use this package (or `context.Context` in general) to pass application-wide core dependencies like Database connection pools or domain repositories. This creates a "Service Locator" anti-pattern, making function signatures dishonest and tests difficult to write. Explicit struct fields remain the idiomatic Go approach for primary domain dependencies.
+
+## Real-World Adoption: `examples/platform`
+
+The [`examples/platform`](./examples/platform) package is a worked adoption proof: it is a lightly adapted copy of `google.golang.org/adk/v2`'s platform package that replaces `context.WithValue` with `plocal.WithProvider`. It is the project's most convincing integration example, because the seam a real library needs — a host-supplied override installed on a context and read downstream — maps directly onto the context-returning injection path.
+
+The adaptation drops ADK's UUID seam and exposes two seams, each a `plocal.WithProvider` call site under a typed `ResourceKey`:
+
+- `WithTimeProvider` / `Now` — install a `TimeProvider`; `Now` reads the current time through it, falling back to `time.Now`.
+- `WithTaskRunner` / `RunTasks` — install a `TaskRunner`; `RunTasks` fans a batch of tasks out through it, falling back to one goroutine per task.
+
+```go
+import "github.com/zodimo/go-provide-local/examples/platform"
+
+// Install a frozen clock for a deterministic run. WithTimeProvider returns the
+// enriched context, so it can be handed to arbitrary downstream code.
+ctx := platform.WithTimeProvider(ctx, func() time.Time { return fixed })
+
+// Any downstream call reads through the installed provider.
+at := platform.Now(ctx)
+
+// Substitute the fan-out strategy without the runtime depending on it.
+ctx = platform.WithTaskRunner(ctx, func(ctx context.Context, tasks []func(context.Context)) {
+	for _, task := range tasks {
+		task(ctx) // run sequentially, in-process
+	}
+})
+platform.RunTasks(ctx, []func(context.Context){doWork, doMoreWork})
+```
+
+See [`examples/platform`](./examples/platform) for the full source, including the ADK provenance note and the tests that pin each seam's behavior.
 
 ## Testing & Benchmarks
 
@@ -203,21 +243,53 @@ make test-all    # race tests then full benchmark run
 
 ### Benchmark Results
 
-Measured on Intel Core Ultra 9 185H, linux/amd64:
+Measured on Intel Core Ultra 9 185H, Go 1.27, linux/amd64, GOMAXPROCS=22.
+Regenerate with `make bench-mem` (5s/bench). Absolute ns/op varies with machine
+and thermal state — the plocal-vs-stdlib *ratios within one run* are the
+load-bearing evidence; the absolute figures are advisory.
+
+**Lookup: `plocal.Use()` vs stdlib `context.Value()`**
+
+Both implementations read the sought key from the root of an identically shaped
+chain of depth N.
+
+| Depth | plocal `Use()` ns/op | stdlib `ctx.Value()` ns/op | plocal allocs/op | stdlib allocs/op |
+|---|---|---|---|---|
+| 1 | 26 | **8** | 0 | 0 |
+| 10 | 132 | **53** | 0 | 0 |
+| 100 | 1170 | **441** | 0 | 0 |
+
+**Scope creation (1 provider injected)**
+
+| Implementation | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| plocal `ProvideAll()` at depth 1 | 343 | 440 | 6 |
+| plocal `ProvideAll()` at depth 100 | 345 | **440** | **6** ← same as depth 1 |
+| stdlib `context.WithValue` at depth 1 | **39** | **48** | **1** |
+
+**Depth scaling (`Use()`)**
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---|---|---|
-| `Use()` depth 1 | 11 | 0 | **0** |
-| `Use()` depth 10 | 56 | 0 | **0** |
-| `Use()` depth 100 | 524 | 0 | **0** |
-| `ProvideAll()` at depth 1 | 209 | 440 | 6 |
-| `ProvideAll()` at depth 100 | 197 | 440 | **6** ← same as depth 1 |
-| plocal `Use()` depth 10 | 58 | 0 | 0 |
-| stdlib `ctx.Value()` depth 10 | 29 | 0 | 0 |
+| `Use()` depth 1 | 26 | 0 | **0** |
+| `Use()` depth 10 | 132 | 0 | **0** |
+| `Use()` depth 100 | 1213 | 0 | **0** |
 
 **Key findings:**
 
-- ✅ `Use()` allocates **zero bytes** at every depth — the fast-lane traversal never touches the heap.
-- ✅ `ProvideAll()` scope creation cost is **depth-independent** — injecting N keys at depth 100 costs the same as at depth 1.
-- ✅ `Use()` lookup scales **linearly** with depth (O(depth)), not geometrically.
-- ⚠️ For a worst-case single-key lookup at shallow depth, `context.Value()` is ~2x faster per step. Each plocal step involves a `map[any]any` lookup; each stdlib step is a simple pointer comparison. plocal's advantage is type safety, zero allocs, and batched scope creation (`ProvideAll` with N keys = 1 node instead of N `context.WithValue` wraps).
+- ⚠️ **stdlib wins raw single-key lookup speed.** For a worst-case single-key
+  lookup, `context.Value()` is faster at every depth (~3x at depth 1, ~2.5x at
+  depth 10, ~2.7x at depth 100). Each plocal step is a `map[any]any` probe; each
+  stdlib step is a pointer comparison + type switch. `Use()` is *not*
+  unconditionally faster than `context.Value()`, and this project no longer
+  claims it is.
+- ✅ **plocal wins type safety.** `Use()` is fully generic — no `any`, no manual
+  type assertions, no runtime panics from a bad assertion.
+- ✅ **plocal wins zero-alloc reads.** `Use()` allocates **0 bytes at every
+  depth** — the fast-lane traversal never touches the heap.
+- ✅ **plocal wins scope creation asymptotically.** `ProvideAll` is O(providers),
+  not O(depth): injecting N keys creates **one** node (6 allocs, 440 B) whether
+  the chain is 1 or 100 deep, while N sequential `context.WithValue` wraps cost
+  one allocation each. stdlib is cheaper for a *single* wrap (1 alloc vs 6); the
+  advantage reverses as providers accumulate in one scope.
+- ✅ **`Use()` lookup scales linearly** with depth (O(depth)), not geometrically.

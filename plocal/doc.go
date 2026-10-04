@@ -40,6 +40,30 @@
 //
 //	id := plocal.Use(ctx, RequestIDKey) // type: string, no assertion needed
 //
+// # Context-Returning Injection
+//
+// [ProvideAll] (and its single-value wrapper [Provide]) evaluate a consumer
+// closure and automatically release the scope when that closure returns:
+//
+//	plocal.ProvideAll(ctx, providers, func(scopedCtx context.Context) {
+//	    // scope lives only for the duration of this closure
+//	})
+//
+// [WithProvider] and [WithProviders] are the counterpart that returns the
+// enriched [context.Context] directly instead of taking a consumer closure:
+//
+//	scopedCtx := plocal.WithProvider(ctx, RequestIDKey, "req-abc-123")
+//	scopedCtx = plocal.WithProviders(scopedCtx, providers)
+//
+// The scope-lifetime difference matters. A closure scope is released the
+// instant the consumer returns and can never outlive it. A context returned by
+// [WithProvider]/[WithProviders] lives as long as the caller keeps it — it is
+// the caller's responsibility to stop using it. Reach for the context-returning
+// form when the enriched context must escape the point where it is built (for
+// example, to stash a provider on a request context that a host framework hands
+// to arbitrary downstream code), and for the closure form when the scope is
+// strictly lexical.
+//
 // # Key Properties
 //
 //   - Type-safe: built on Go 1.18 generics; no manual type assertions.

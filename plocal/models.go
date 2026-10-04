@@ -29,7 +29,15 @@ func (p providerImpl[T]) apply(m map[any]any) {
 type ResourceKey[T any] struct {
 	// Default is the fallback value returned by [Use] when the key has not
 	// been injected into any ancestor scope. Set via [NewResourceKey].
-	Default T
+	defaultValue T
+}
+
+func (r *ResourceKey[T]) Default() T {
+	if r == nil {
+		var zero T
+		return zero
+	}
+	return r.defaultValue
 }
 
 // NewResourceKey creates a new [ResourceKey] for values of type T with the
@@ -42,5 +50,5 @@ type ResourceKey[T any] struct {
 //	var RequestIDKey = plocal.NewResourceKey[string]("unknown-req-id")
 //	var ThemeKey     = plocal.NewResourceKey[Theme](DefaultTheme)
 func NewResourceKey[T any](fallback T) *ResourceKey[T] {
-	return &ResourceKey[T]{Default: fallback}
+	return &ResourceKey[T]{defaultValue: fallback}
 }
