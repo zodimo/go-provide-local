@@ -200,36 +200,6 @@ Retrieves the typed value from the nearest node in the registry tree. Returns th
 
 **Anti-Pattern Warning:** Do not use this package (or `context.Context` in general) to pass application-wide core dependencies like Database connection pools or domain repositories. This creates a "Service Locator" anti-pattern, making function signatures dishonest and tests difficult to write. Explicit struct fields remain the idiomatic Go approach for primary domain dependencies.
 
-## Real-World Adoption: `examples/platform`
-
-The [`examples/platform`](./examples/platform) package is a worked adoption proof: it is a lightly adapted copy of `google.golang.org/adk/v2`'s platform package that replaces `context.WithValue` with `plocal.WithProvider`. It is the project's most convincing integration example, because the seam a real library needs — a host-supplied override installed on a context and read downstream — maps directly onto the context-returning injection path.
-
-The adaptation drops ADK's UUID seam and exposes two seams, each a `plocal.WithProvider` call site under a typed `ResourceKey`:
-
-- `WithTimeProvider` / `Now` — install a `TimeProvider`; `Now` reads the current time through it, falling back to `time.Now`.
-- `WithTaskRunner` / `RunTasks` — install a `TaskRunner`; `RunTasks` fans a batch of tasks out through it, falling back to one goroutine per task.
-
-```go
-import "github.com/zodimo/go-provide-local/examples/platform"
-
-// Install a frozen clock for a deterministic run. WithTimeProvider returns the
-// enriched context, so it can be handed to arbitrary downstream code.
-ctx := platform.WithTimeProvider(ctx, func() time.Time { return fixed })
-
-// Any downstream call reads through the installed provider.
-at := platform.Now(ctx)
-
-// Substitute the fan-out strategy without the runtime depending on it.
-ctx = platform.WithTaskRunner(ctx, func(ctx context.Context, tasks []func(context.Context)) {
-	for _, task := range tasks {
-		task(ctx) // run sequentially, in-process
-	}
-})
-platform.RunTasks(ctx, []func(context.Context){doWork, doMoreWork})
-```
-
-See [`examples/platform`](./examples/platform) for the full source, including the ADK provenance note and the tests that pin each seam's behavior.
-
 ## Testing & Benchmarks
 
 The library ships with a compliance test suite that verifies every documented claim. Run it with:
