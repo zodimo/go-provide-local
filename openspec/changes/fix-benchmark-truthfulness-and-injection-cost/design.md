@@ -1,146 +1,166 @@
 ## Context
 
-`plocal/api.go` is correct. `Use()` walks the Prototype Chain of
-`registryNode`s the library owns; `context.WithValue` wraps one node per key.
-The benchmarks mis-measured that structure, and the docs inherited the error.
+The library stores a scope's values in a `registryNode` — a linked prototype
+chain the library owns — whereas `context.WithValue` wraps one node per key.
+The benchmark harness built the wrong structure (one node regardless of depth),
+the docs narrated depth (the one axis plocal loses), and the performance
+optimization that added a `Provide` fast path introduced a race and a shadowing
+bug. This change fixes the harness, the defects, and the narrative.
 
 All numbers below are from this machine: Intel Core Ultra 9 185H, Go 1.27.0,
 linux/amd64, GOMAXPROCS=22, `-benchmem`, `-benchtime=1–2s`. They are advisory in
-absolute terms; ratios within a run and alloc counts are the evidence.
+absolute terms; ratios within a run, alloc counts, and level counts are the
+evidence.
 
-### Measured: the committed depth ramp is an artifact
+### Corrected: the harness bug and the depth axis
 
-| Benchmark | Committed docs | Fresh run | Stable? |
-|---|---|---|---|
-| `Use` depth 1 | 26 ns | 27.6 ns | ✅ |
-| `Use` depth 10 | 132 ns | 25.8 ns | ✅ |
-| `Use` depth 100 | 1213 ns | 26.4 ns | ✅ (`-count=3`: 24.9–27.6) |
-| stdlib `Value` depth 1 | 8 ns | 7.6 ns | ✅ |
-| stdlib `Value` depth 10 | 53 ns | 54.3 ns | ✅ |
-| stdlib `Value` depth 100 | 441 ns | 439.7 ns | ✅ |
+`buildChain` called `WithProviders` once for any `depth`, so every depth
+benchmark measured a single node. Fixed, `buildChain(depth)` produces exactly
+`depth` linked nodes (verified by `chainDepth` and by forcing a full traversal
+with a never-present key). The committed ramp was **not** a phantom — it
+reproduces once the chain is real:
 
-plocal is **flat** at ~26 ns; the committed 26/132/1213 is a phantom from
-`buildChain` creating one node regardless of `depth`.
-
-### Measured: injection cost and shape (the real axis)
-
-N=32, injecting N values into one scope:
-
-| Strategy | ns/op | B/op | allocs/op | context levels |
-|---|---|---|---|---|
-| `WithProviders(ctx, n)` | 2049 | 2456 | **6** | **1** |
-| N× `WithProvider` | 9955 | 13312 | 160 | 32 |
-| N× `context.WithValue` | **1452** | **1536** | 32 | 32 |
-
-Full sweep (ns/op | allocs/op):
-
-| N | `WithProviders` | N× `WithProvider` | N× `context.WithValue` |
-|---|---|---|---|
-| 1 | 309 \| 4 | 301 \| 5 | 43 \| 1 |
-| 2 | 355 \| 4 | 679 \| 10 | 86 \| 2 |
-| 4 | 407 \| 4 | 1336 \| 20 | 168 \| 4 |
-| 8 | 535 \| 4 | 3016 \| 40 | 344 \| 8 |
-| 16 | 1242 \| 6 | 5121 \| 80 | 683 \| 16 |
-| 32 | 2049 \| 6 | 9955 \| 160 | 1452 \| 32 |
-
-### Measured: lookup after injection (worst case — first-injected key)
-
-| N | plocal `Use` | stdlib `Value` |
+| Depth | plocal `Use()` | stdlib `ctx.Value()` |
 |---|---|---|
-| 1 | 27.5 ns | **6.1 ns** |
-| 4 | 29.4 ns | 24.6 ns (crossover) |
-| 8 | 30.6 ns | 43.9 ns |
-| 16 | 29.5 ns | 79.5 ns |
-| 32 | **26.3 ns** | 164.3 ns |
+| 1 | 37 ns | **8 ns** |
+| 10 | 256 ns | **54 ns** |
+| 100 | 2554 ns | **448 ns** |
 
-plocal is flat; stdlib is linear; crossover at N≈4.
+Both are linear; stdlib is cheaper at every depth. Depth is disclosed as a
+plocal loss, not a headline.
+
+### Measured: the real axis — injection width
+
+Read the outermost-injected key after injecting N values with each shape:
+
+| N | batched (1 node) | spread (N scopes) |
+|---|---|---|
+| 1 | 37 ns | 37 ns |
+| 4 | 37 ns | 112 ns |
+| 8 | 38 ns | 213 ns |
+| 16 | 37 ns | 429 ns |
+| 32 | **37 ns** | **859 ns** |
+
+Batched reads are **flat in N**; spread reads are **linear in N**.
+
+### Measured: injection cost and shape (N = 32)
+
+| Strategy | ns/op | B/op | allocs/op | levels |
+|---|---|---|---|---|
+| `WithProviders(ctx, 32)` | 2079 | 2488 | **6** | **1** |
+| 32× `WithProviders` (spread) | 9519 | 13824 | 128 | 32 |
+| 32× `UpdateProvider` (upsert) | 2896 | 512 | 32 | 1 |
+| 32× `context.WithValue` | **1418** | **1536** | 32 | 32 |
+
+### Measured: the two defects the fast path introduced
+
+- **Race:** upsert mutated a `registryNode.values` map that may already be
+  shared; concurrent `Use` + `WithProvider` fails `-race`.
+- **Shadowing:** a `Provide` direct-context value permanently shadowed later
+  registry injections of the same key; no lookup ordering fixes both directions.
+
+Both are fixed by (a) a `sync.RWMutex` per node, (b) `Provide` back on the
+registry, (c) `Use()` registry-only (no fast path). All injection orders then
+follow "nearest scope wins" (verified across five orderings).
 
 ## Goals / Non-Goals
 
 **Goals:**
 
 - Make `buildChain` measure what its name and comment claim.
-- Replace every committed number with a freshly measured one, and make the file
-  and the README agree with a single run.
-- Measure the library's actual axis: injection shape (levels and allocs vs N keys).
-- State the trade honestly, including where stdlib wins.
-- Correct the false spec requirements so the suite stops asserting things it
-  cannot pass.
+- Fix the race and the shadowing defect in production code.
+- Replace every committed number with a freshly measured one; make the file and
+  the README agree with a single run.
+- Reframe the performance story around injection **width** (N values → one node
+  → flat reads), the axis the library is actually built around.
+- State the trade honestly, including where stdlib wins (raw single-key lookup
+  at every depth; raw injection ns/bytes).
+- Correct the spec so it asserts stable structure (allocs, levels,
+  flat-vs-linear shape), not timing.
 
 **Non-Goals:**
 
-- No production code changes to `api.go` / `models.go`.
-- No new dependencies.
+- No change to the *intended* public API surface beyond documenting the new
+  `UpdateProvider`/`UpdateProviders`.
+- No new dependencies (only `sync` and `context`).
 - No CI benchmark gating; this change fixes what is measured, not when.
-- No attempt to make plocal beat stdlib on shallow single-key lookup — measured
-  crossover is N≈4 and that is the honest boundary.
-- No commitment to specific ns/op thresholds in the spec; assert structure
-  (allocs, flatness, ordering) not timing.
+- No attempt to make plocal beat stdlib on deep single-value chains or raw
+  injection ns — the measurements say it does not, and the docs must not claim
+  it does.
+- No commitment to specific ns/op thresholds in the spec; assert structure.
 
 ## Decisions
 
 ### Decision 1: Fix the harness before touching a single number
 
-Rewriting the baseline numbers without fixing `buildChain` would enshrine a new
-set of phantoms. Order is: fix the helper, then re-measure, then update docs and
-spec. The corrected `buildChain` nests `depth` times:
+Rewriting the baseline numbers without fixing `buildChain` would keep measuring
+a 1-node chain. Order: fix the helper, re-measure, then update docs and spec.
+The corrected `buildChain` nests `depth` times with the sought key at the
+outermost node, so a read is a worst-case traversal. Verified by
+`TestBuildChain_RegistryDepth`.
 
-```
-for i := 0; i < depth; i++ { ctx = <one-node scope> }   // depth nodes, root first
-```
+### Decision 2: Inject N values, then measure reads — not depth
 
-with the sought key injected at the root so a read is worst-case traversal.
+The comparison that matters is not "read a key at depth N" (plocal loses that at
+every N and it is not what the library optimizes) but "inject N values for one
+scope, then read: batched into one node vs spread across N scopes". The sweep
+reports levels and allocs (stable facts); ns/op is advisory.
 
-### Decision 2: Make injection shape a first-class measured axis
+### Decision 3: Report the batch-vs-spread gap explicitly
 
-The comparison that matters is not "lookup at depth N" (a symptom) but "how many
-context levels and allocations does injecting N values cost, and what does that
-do to reads" (the cause). The sweep reports levels and allocs, because those are
-the stable, machine-independent facts; ns/op is advisory.
-
-### Decision 3: Report the `WithProviders` vs N×`WithProvider` gap explicitly
-
-Measured: ~5x faster and ~27x fewer allocs at N=32. This is a *within-library*
-finding the docs never made. It turns "use `ProvideAll` for multiple values"
-from a stylistic note into a measured recommendation.
+Measured: ~5x faster and ~20x fewer allocs at N=32, plus flat-vs-linear reads.
+This turns "use `ProvideAll` for multiple values" from a stylistic note into a
+measured recommendation: batching is cheaper to build *and* keeps reads flat.
 
 ### Decision 4: Do not claim plocal wins on raw injection speed
 
-At N=32, plain `context.WithValue` is 1452 ns / 1536 B vs plocal's 2049 ns /
-2456 B — stdlib is cheaper in raw cost even at high N. plocal's injection win is
-**alloc count and resulting shape** (6 allocs, 1 level vs 32 allocs, 32 levels),
-not nanoseconds. The spec and README must say this, because the previous spec's
-unconditional "faster" requirement is exactly the kind of claim that cannot
-survive a re-run.
+At N=32, plain `context.WithValue` is 1418 ns / 1536 B vs plocal's 2079 ns /
+2488 B — stdlib is cheaper in raw cost even at high N. plocal's injection win is
+level count and alloc count (6 allocs, 1 level vs 32 allocs, 32 levels), which is
+what buys the flat reads. The spec and README must say this.
 
-### Decision 5: Express the lookup comparison as depth-conditional with a crossover
+### Decision 5: State the depth result truthfully
 
-The requirement becomes: for N ≤ ~4 stdlib is faster in raw ns; for larger N
-plocal is faster and the gap widens; plocal's cost is independent of depth while
-stdlib's is linear. A test can verify flatness (allocs == 0 at all depths;
-ns/op within a tolerance band across depths) — it cannot verify a fixed ns.
+With the harness fixed, plocal `Use()` is linear in depth and stdlib is cheaper
+at every depth. The spec requirement is therefore *not* "flat plocal vs linear
+stdlib"; it is: plocal lookup grows with the number of nodes, and depth is
+disclosed as a non-advantage. A test can verify structure (0 allocs; monotonic
+growth with node count) — it cannot verify a fixed ns.
 
-### Decision 6: Demonstrate scope override with a test, not a benchmark
+### Decision 6: Fix the two defects rather than document around them
 
-"Local override, not permanent replace" is a semantic, not a timing. It belongs
-in the correctness suite (`api_test.go`) as a done-observable assertion: an
-inner scope overriding a key leaves the outer scope's value intact, and the
-same guarantee via stdlib requires re-wrapping. Benchmarking it adds no
-information.
+The race and the shadowing bug are correctness problems in shared code, so they
+are fixed in production, not worked around:
+
+- **Race:** `registryNode` gains a `sync.RWMutex`. `Use()` reads under `RLock`;
+  `UpdateProvider`/`UpdateProviders` and the `WithProvider` merge path write
+  under `Lock`. Cost is small (depth-1 read unchanged; the deep walk pays a
+  modest per-node lock, on the already-losing path).
+- **Shadowing:** `Provide` returns to the registry (equivalent to `ProvideAll`
+  with one provider) and `Use()` drops the `c.Value(key)` fast path. A direct
+  stdlib key and a registry node cannot encode relative position, so the only
+  correct design keeps all values in one structure.
+
+### Decision 7: Demonstrate scope override with a test, not a benchmark
+
+"Local override, not permanent replace" is a semantic. It belongs in the
+correctness suite as a done-observable assertion: an inner scope shadows a key,
+the outer scope's value is unchanged, for both the closure and derived-context
+APIs. Benchmarking it adds no information.
 
 ## Risks / Trade-offs
 
-- **Re-measured numbers drift again** → Report alloc counts (stable) and
-  structural relationships as the assertions; keep ns/op advisory and dated with
-  a machine note.
-- **The corrected depth benchmark may still be flat** → If flat, that *is* the
-  finding: state flat plocal vs linear stdlib and delete the linearity claim.
-  Do not re-introduce a ramp to make the old story true.
-- **`-benchtime` used by the docs may not match the run** → Standardize the
-  Makefile target the docs cite, or drop ns/op from the committed block.
-- **Crossover at N≈4 is noise-adjacent** (24.6 vs 29.4 ns) → State it as a
-  range ("roughly 4–8 depending on machine"), not a precise integer, and let
-  the flat-vs-linear shape carry the argument.
-- **README narrative is load-bearing for the library's pitch** → The inverted
-  claim ("stdlib faster at every depth") is the most visible error; correct it
-  first, before the tables.
+- **Re-measured numbers drift again** → Assert alloc/level counts and the
+  flat-vs-linear shape; keep ns/op advisory and dated with a machine note.
+- **The mutex costs on the deep walk** → Measured ~35% on a 32-level walk, on the
+  path that already loses to stdlib; the width axis (the win) is unaffected.
+  Accept the cost for race-freedom.
+- **`WithProvider` upsert surprises** → Merging distinct keys into the current
+  node means `WithProvider` cannot build a deep chain and repeated calls stay at
+  one level. Documented in the API reference and asserted by a test.
+- **`Update*` mutates a live context** → Documented as a deliberate upsert with
+  a race guard; the README warns to prefer `Provide`/`ProvideAll` for scope-local
+  injection.
+- **README narrative is load-bearing for the pitch** → Move the pitch off depth
+  (where it loses) onto width and type safety (where it wins); correct the
+  headline before the tables.

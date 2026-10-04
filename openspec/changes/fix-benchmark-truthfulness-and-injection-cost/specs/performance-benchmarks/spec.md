@@ -1,73 +1,111 @@
 ## MODIFIED Requirements
 
-### Requirement: Use lookup time is independent of registry depth
-`Use()` SHALL traverse only the nodes the library owns, so its lookup cost is
-independent of how many scopes are nested. Nesting more scopes MUST NOT increase
-`Use()` cost. This is a correction of the prior requirement, which claimed
-`Use()` scales linearly with depth — that description matches stdlib
-`context.Value()`, not `Use()`.
+### Requirement: Use lookup time scales linearly with depth (O(depth))
+`Use()` SHALL scale linearly with the depth of the registry chain. It walks the
+Prototype Chain of nodes the library owns, probing each node's values, so its
+lookup time MUST NOT stay flat and MUST NOT grow faster than linearly. This
+corrects an earlier framing that implied `Use()` was depth-independent; a
+corrected harness shows the growth is real, and that stdlib is nonetheless
+cheaper per step.
 
-#### Scenario: Use cost does not grow with scope depth
-- **WHEN** `Use()` is benchmarked on correctly nested chains of depth 1, 10, and 100, seeking a key at the root
-- **THEN** the ns/op values at all three depths fall within a narrow tolerance band of one another (no proportional growth)
-- **AND** allocations per operation remain 0 at every depth
+#### Scenario: Depth-scaling benchmark confirms linear growth
+- **WHEN** `Use()` is benchmarked at depth 1, 10, and 100 on a correctly nested
+  chain, seeking a key at the outermost node
+- **THEN** the ns/op values increase approximately proportionally to depth
+  (no plateau, and not superlinear)
 
-#### Scenario: Stdlib lookup grows linearly while plocal stays flat
-- **WHEN** plocal `Use()` and stdlib `context.Value()` are benchmarked at the same depths on shape-equivalent chains
-- **THEN** stdlib ns/op grows approximately proportionally to depth while plocal ns/op does not
+### Requirement: plocal Use is faster than stdlib context.WithValue traversal for equivalent depth
+This requirement is **withdrawn as false**, and the spec SHALL NOT assert a
+plocal speed advantage here. For a matched-depth chain of single-value nodes,
+stdlib `context.Value()` is cheaper than `Use()` at every depth (each plocal step
+is a lock-guarded map probe plus a pointer hop; each stdlib step is a pointer
+compare + type switch). The spec SHALL instead require that the benchmark suite
+measures both and records the result honestly.
 
-### Requirement: plocal and stdlib lookup trade off by depth, with a crossover
-For equivalent-depth, worst-case lookup, plocal and stdlib SHALL be compared
-honestly: stdlib is faster for shallow contexts and plocal is faster for deeper
-ones, with a crossover at a small depth. This replaces the prior unconditional
-claim that plocal is faster, and the README's inverse claim that stdlib is faster
-at every depth; both are false.
+#### Scenario: Stdlib advantage is measured and disclosed
+- **WHEN** both plocal and stdlib are benchmarked at depths 1, 10, and 100
+  reading a value from the outermost node
+- **THEN** stdlib `context.Value()` ns/op is lower than plocal `Use()` ns/op at
+  every depth
+- **AND** the recorded result and docs state this is a disclosed trade-off
 
-#### Scenario: Stdlib wins at depth 1
-- **WHEN** both implementations are benchmarked at depth 1 reading the sole/root key
-- **THEN** stdlib `context.Value()` ns/op is lower than plocal `Use()` ns/op
+## ADDED Requirements
 
-#### Scenario: plocal wins at depth 100
-- **WHEN** both implementations are benchmarked at depth 100 reading the root key
-- **THEN** plocal `Use()` ns/op is lower than stdlib `context.Value()` ns/op
-- **AND** the gap is material (plocal is flat while stdlib is linear)
+### Requirement: Injecting N values for one scope creates one node and keeps reads flat
+Injecting N values for one scope via `ProvideAll`/`WithProviders` SHALL create
+exactly one registry level and a bounded, N-independent allocation count, in
+contrast to N nested scopes which create N levels and N allocations. A read of a
+key in the batched scope SHALL stay flat as N grows, while reading a key spread
+across N scopes SHALL grow with N.
 
-### Requirement: ProvideAll amortizes injection into one context level
-Injecting N values for one scope SHALL create exactly one context level and a
-bounded, N-independent allocation count, in contrast to N sequential
-`context.WithValue` wraps which create N levels and N allocations. Raw ns/op and
-raw bytes/op for a single stdlib wrap MAY be lower than plocal's node creation;
-the asserted advantage is level count and allocation count, not raw speed.
+#### Scenario: One level for N providers
+- **WHEN** N values are injected via a single `ProvideAll`/`WithProviders` call
+- **THEN** the resulting registry depth is 1 for any N
 
-#### Scenario: One level for N providers, N levels for N stdlib wraps
-- **WHEN** N values are injected via `ProvideAll`/`WithProviders` and, separately, via N sequential `context.WithValue` calls
-- **THEN** the plocal result has registry depth 1 and the stdlib result has context depth N
+#### Scenario: N scopes cost N levels
+- **WHEN** N values are each injected into their own nested scope
+- **THEN** the resulting registry depth is N
 
-#### Scenario: Allocation count is sublinear in N for plocal
+#### Scenario: Batched reads stay flat while spread reads grow
+- **WHEN** the outermost-injected key is read after injecting N values batched
+  into one node, and, separately, after spreading them across N scopes, for
+  N ∈ {1, 4, 8, 16, 32}
+- **THEN** the batched ns/op stays within a narrow band across all N
+- **AND** the spread ns/op grows with N
+
+#### Scenario: Allocation count is sublinear in N for batching
 - **WHEN** injection is benchmarked for N ∈ {1, 4, 16, 32}
-- **THEN** plocal allocs/op stays within a small constant band while stdlib allocs/op grows proportionally to N
+- **THEN** batched allocs/op stays within a small constant band while N-scope
+  allocs/op grows proportionally to N
 
-### Requirement: WithProviders is measurably cheaper than sequential WithProvider
-A single `WithProviders` call SHALL cost fewer allocations and less time than
-N sequential `WithProvider` calls when injecting the same N values into one
-scope. The sequential path SHALL be treated as the worst of the three strategies
-and MUST NOT be presented as equivalent to batching.
+### Requirement: Batched injection is cheaper than spreading the same values
+A single batched injection call SHALL cost fewer allocations and less time than
+spreading the same N values across N nested scopes. Spreading SHALL be treated
+as the worse strategy and MUST NOT be presented as equivalent to batching.
 
-#### Scenario: Batched injection beats sequential injection
-- **WHEN** injecting N=32 values via one `WithProviders` call is benchmarked against 32 sequential `WithProvider` calls
+#### Scenario: Batched injection beats spread injection
+- **WHEN** injecting N=32 values via one `WithProviders` call is benchmarked
+  against 32 calls that each add a scope
 - **THEN** the batched call reports fewer allocs/op and lower ns/op
+
+### Requirement: The suite reports where stdlib wins, without asserting a fixed ns/op threshold
+The spec and docs SHALL state plainly where a measurement favors stdlib — raw
+single-key lookup at every depth, and raw injection ns/bytes for a single wrap.
+No requirement SHALL assert a fixed ns/op threshold; assertions SHALL be on
+structure (allocation counts, level counts, flat-vs-linear shape).
+
+#### Scenario: Raw injection cost favors stdlib
+- **WHEN** the injection-cost benchmarks report ns/op and B/op for N values
+  injected with plocal and with N sequential `context.WithValue` calls
+- **THEN** the recorded result notes stdlib's lower raw ns/bytes at equal N
+- **AND** records plocal's advantage as level and allocation count, not speed
 
 ### Requirement: Scope override is local, not a permanent replacement
 An inner scope's value for a key SHALL shadow only within that scope; the outer
-scope's value MUST be unchanged once the inner scope is exited. This is the
-"local override, not permanent replace" semantic, and the spec SHALL record that
-the equivalent with stdlib requires re-wrapping the context.
+scope's value MUST be unchanged once the inner scope is exited. This SHALL hold
+regardless of which injection API is used, and for both the closure-scoped
+(`Provide`/`ProvideAll`) and derived-context
+(`WithProvider`/`WithProviders`/`Update*`) APIs.
 
 #### Scenario: Inner override leaves outer scope intact
-- **WHEN** a key is injected at an outer scope, overridden at an inner scope, and read again from the outer context after the inner scope
+- **WHEN** a key is injected at an outer scope, overridden at an inner scope, and
+  read again from the outer context after the inner scope
 - **THEN** the inner read returns the inner value
-- **AND** the post-inner read on the outer context returns the original outer value
+- **AND** the post-inner read on the outer context returns the original value
 
-#### Scenario: Override works with the context-returning API too
-- **WHEN** `WithProviders` derives an inner context that overrides a key, and both the parent and derived contexts remain available
-- **THEN** reading via the derived context returns the override while reading via the parent context returns the original value
+#### Scenario: Override composes across API forms
+- **WHEN** an outer value is injected with any one API and overridden at an inner
+  scope with any other (`Provide`, `ProvideAll`, `WithProvider`, `WithProviders`)
+- **THEN** the inner read returns the override
+- **AND** the outer context still reads its original value
+
+### Requirement: Upsert writes are race-free against concurrent reads
+Upsert SHALL be safe to call concurrently with `Use()` on the same context. This
+covers `UpdateProvider`/`UpdateProviders` and the `WithProvider` path that merges
+a new key into the current scope. The suite SHALL include a test that exercises
+upsert and read concurrently under the race detector.
+
+#### Scenario: Concurrent upsert and read
+- **WHEN** one goroutine repeatedly calls `Use(base, key)` while another
+  upserts into `base`
+- **THEN** the test passes under `go test -race` with no data race reported

@@ -311,3 +311,194 @@ func TestGoroutineSafety_ConcurrentUse(t *testing.T) {
 		return struct{}{}
 	})
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §3 Scope-Override Semantics
+//
+// "Local override, not permanent replace": an inner scope may shadow a key, but
+// the outer scope's value is untouched once the inner scope is left. With stdlib
+// context.WithValue the equivalent requires re-wrapping the context.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 3.1 An inner ProvideAll override leaves the outer scope's value intact.
+func TestScopeOverride_ProvideAll_LeavesOuterIntact(t *testing.T) {
+	key := NewResourceKey[string]("default")
+
+	Provide(context.Background(), key, "outer", func(outerCtx context.Context) struct{} {
+		if got := Use(outerCtx, key); got != "outer" {
+			t.Fatalf("outer scope: expected %q, got %q", "outer", got)
+		}
+
+		// ProvideAll re-injects the same key at an inner scope.
+		ProvideAll(outerCtx, []Provider{
+			Value(key, "inner"),
+			Value(NewResourceKey[int](0), 1),
+		}, func(innerCtx context.Context) struct{} {
+			if got := Use(innerCtx, key); got != "inner" {
+				t.Errorf("inner scope: expected override %q, got %q", "inner", got)
+			}
+			return struct{}{}
+		})
+
+		// Outer must still read its own value — the override was local.
+		if got := Use(outerCtx, key); got != "outer" {
+			t.Errorf("outer after inner ProvideAll: expected %q, got %q", "outer", got)
+		}
+		return struct{}{}
+	})
+}
+
+// 3.2 The context-returning API: WithProviders override is local; the parent
+// context still reads the original.
+func TestScopeOverride_WithProviders_ParentUnaffected(t *testing.T) {
+	key := NewResourceKey[string]("default")
+
+	parent := WithProviders(context.Background(), []Provider{Value(key, "parent-value")})
+	if got := Use(parent, key); got != "parent-value" {
+		t.Fatalf("parent before: expected %q, got %q", "parent-value", got)
+	}
+
+	child := WithProviders(parent, []Provider{Value(key, "child-value")})
+
+	if got := Use(child, key); got != "child-value" {
+		t.Errorf("child: expected override %q, got %q", "child-value", got)
+	}
+	// The parent context value is unchanged: the override lived only in child.
+	if got := Use(parent, key); got != "parent-value" {
+		t.Errorf("parent after deriving child: expected %q, got %q", "parent-value", got)
+	}
+}
+
+// 3.3 WithProvider override (existing key) is likewise scoped to the new node.
+func TestScopeOverride_WithProvider_ExistingKeyScopes(t *testing.T) {
+	key := NewResourceKey[string]("default")
+
+	base := WithProviders(context.Background(), []Provider{Value(key, "base")})
+	derived := WithProvider(base, key, "derived") // key exists -> new shadowing node
+
+	if got := Use(derived, key); got != "derived" {
+		t.Errorf("derived: expected %q, got %q", "derived", got)
+	}
+	if got := Use(base, key); got != "base" {
+		t.Errorf("base after WithProvider override: expected %q, got %q", "base", got)
+	}
+}
+
+// 3.4 WithProvider with a NEW key merges into the current node without adding a
+// registry level, and both keys remain readable.
+func TestWithProvider_NewKey_MergesIntoCurrentScope(t *testing.T) {
+	k1 := NewResourceKey[string]("d1")
+	k2 := NewResourceKey[string]("d2")
+
+	base := WithProviders(context.Background(), []Provider{Value(k1, "v1")})
+	before := chainDepth(base)
+
+	merged := WithProvider(base, k2, "v2")
+
+	if got := chainDepth(merged); got != before {
+		t.Errorf("WithProvider(new key): registry depth = %d, want %d (should merge, not nest)", got, before)
+	}
+	if got := Use(merged, k1); got != "v1" {
+		t.Errorf("k1 after merge: expected %q, got %q", "v1", got)
+	}
+	if got := Use(merged, k2); got != "v2" {
+		t.Errorf("k2 after merge: expected %q, got %q", "v2", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §4 Upsert (UpdateProvider / UpdateProviders)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 4.1 UpdateProvider overwrites a value in the current scope's node and returns
+// the same context (no new level), and the new value is visible via Use.
+func TestUpdateProvider_OverwritesInPlace(t *testing.T) {
+	key := NewResourceKey[string]("default")
+
+	ctx := WithProviders(context.Background(), []Provider{Value(key, "original")})
+	depthBefore := chainDepth(ctx)
+
+	updated := UpdateProvider(ctx, Value(key, "updated"))
+
+	if got := chainDepth(updated); got != depthBefore {
+		t.Errorf("UpdateProvider: registry depth = %d, want %d (no new level)", got, depthBefore)
+	}
+	if got := Use(updated, key); got != "updated" {
+		t.Errorf("after UpdateProvider: expected %q, got %q", "updated", got)
+	}
+	// Upsert mutates the existing node in place, so the same context value
+	// reflects the change (that is the documented semantics).
+	if got := Use(ctx, key); got != "updated" {
+		t.Errorf("original context after in-place upsert: expected %q, got %q", "updated", got)
+	}
+}
+
+// 4.2 UpdateProvider with no existing registry node creates one.
+func TestUpdateProvider_NoNode_FallsBackToNewNode(t *testing.T) {
+	key := NewResourceKey[string]("default")
+
+	ctx := UpdateProvider(context.Background(), Value(key, "created"))
+
+	if got := chainDepth(ctx); got != 1 {
+		t.Errorf("UpdateProvider on empty context: registry depth = %d, want 1", got)
+	}
+	if got := Use(ctx, key); got != "created" {
+		t.Errorf("expected %q, got %q", "created", got)
+	}
+}
+
+// 4.3 UpdateProviders upserts several keys into the current node at once.
+func TestUpdateProviders_UpsertsMultiple(t *testing.T) {
+	k1 := NewResourceKey[int](0)
+	k2 := NewResourceKey[string]("d")
+
+	ctx := WithProviders(context.Background(), []Provider{Value(k1, 1)})
+	depthBefore := chainDepth(ctx)
+
+	updated := UpdateProviders(ctx, []Provider{
+		Value(k1, 42),
+		Value(k2, "added"),
+	})
+
+	if got := chainDepth(updated); got != depthBefore {
+		t.Errorf("UpdateProviders: registry depth = %d, want %d (no new level)", got, depthBefore)
+	}
+	if got := Use(updated, k1); got != 42 {
+		t.Errorf("k1 after upsert: expected 42, got %d", got)
+	}
+	if got := Use(updated, k2); got != "added" {
+		t.Errorf("k2 after upsert: expected %q, got %q", "added", got)
+	}
+}
+
+// 4.4 Upsert must be data-race free against concurrent Use() on the same
+// shared parent context. Run with -race.
+func TestUpsert_ConcurrentWithUse_NoRace(t *testing.T) {
+	readKey := NewResourceKey[int](-1)
+	base := WithProviders(context.Background(), []Provider{Value(readKey, 7)})
+
+	const iters = 5000
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Reader goroutine: repeatedly read the shared base context.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			if got := Use(base, readKey); got != 7 {
+				t.Errorf("concurrent read: expected 7, got %d", got)
+				return
+			}
+		}
+	}()
+
+	// Writer goroutine: upsert new distinct keys into the same node.
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iters; i++ {
+			_ = WithProvider(base, NewResourceKey[int](i), i)
+		}
+	}()
+
+	wg.Wait()
+}

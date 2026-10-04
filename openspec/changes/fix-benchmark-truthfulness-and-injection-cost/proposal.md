@@ -1,8 +1,9 @@
 ## Why
 
-The benchmark suite measures the wrong axis, and its committed numbers do not
-reproduce. Both problems were found by running the suite on the author's own
-machine (Intel Core Ultra 9 185H, Go 1.27.0, linux/amd64, GOMAXPROCS=22).
+The benchmark suite measures the wrong axis, and the harness it measures with
+does not build the structure it claims. Both were found by running the suite on
+the author's own machine (Intel Core Ultra 9 185H, Go 1.27.0, linux/amd64,
+GOMAXPROCS=22).
 
 **Gap 1 — `buildChain` does not build a chain.** The helper claims to create "a
 registry chain of the given depth" but calls `WithProviders` exactly once:
@@ -17,96 +18,128 @@ return WithProviders(context.Background(), providers), rootKey
 
 One `WithProviders` call creates **one** node holding N values. So
 `BenchmarkUse_Depth100` traverses a linked list of length 1 and measures a
-single `map[any]any` probe — not a 100-deep traversal. The committed baseline
-(26 → 132 → 1213 ns/op) is therefore not a measurement of plocal at all.
+single `map[any]any` probe — not a 100-deep traversal. Every depth benchmark,
+and the README text built on it, describes a structure the helper never built.
 
-**Gap 2 — the committed numbers are a stale artifact.** A fresh `make bench-mem`
-reports plocal `Use()` at **~26 ns/op at every depth** (depth 1/10/100 →
-27.6 / 25.8 / 26.4), stable across `-count=3` (24.9–27.6 ns). The committed
-block claims 26 / 132 / 1213. The stdlib column, by contrast, reproduces
-faithfully (8 / 53 / 441 → 7.6 / 54.3 / 439.7). The suite fixed the stdlib half
-of the comparison and then certified a plocal half that was never measuring a
-chain.
+**Gap 2 — with the harness fixed, depth is disclosed as a plocal *loss*.**
+Once `buildChain` nests one node per level (verified: registry depth == `depth`
+for 1/2/4/10/100, and a never-present key forces full traversal), plocal `Use()`
+is linear in depth and stdlib `context.Value()` is cheaper at **every** depth:
 
-**Gap 3 — the resulting narrative is inverted.** Because the false ramp made
-plocal look O(depth) and stdlib look cheaper, `README.md` concluded:
+| Depth | plocal `Use()` | stdlib `ctx.Value()` |
+|---|---|---|
+| 1 | 37 ns | **8 ns** |
+| 10 | 256 ns | **54 ns** |
+| 100 | 2554 ns | **448 ns** |
 
-> "stdlib `context.Value()` is faster at every depth (~3x at depth 1, ~2.5x at
-> depth 10, ~2.7x at depth 100)"
+plocal walks its whole prototype chain with a (lock-guarded) `map[any]any` probe
+per node; stdlib does a pointer compare + type switch per node. Depth is not an
+axis plocal wins, and the docs must say so instead of implying otherwise.
 
-Measured at depth 100: plocal **26 ns** vs stdlib **440 ns** — plocal is ~17x
-faster, not 2.7x slower. `Use()` is flat in depth because it walks only its own
-nodes; `context.Value()` is linear because it walks every node. The library's
-one genuinely strong result is being documented as a loss.
+**Gap 3 — the real axis (injection width) was unmeasured.** The library's actual
+claim is that N values for a scope go into **one node**, whereas stdlib needs
+**N context levels**. The consequence is visible in reads: a key injected
+alongside N-1 other values reads in ~37 ns **regardless of N** when the values
+are batched into one node, but grows linearly when spread across N scopes:
 
-**Gap 4 — the real performance axis is unmeasured.** The library's actual claim
-is about **injection shape**, not lookup depth: it stores N values for a scope in
-**one flat node**, where stdlib needs **N context levels**. The existing
-`ScopeCreation` benchmark only tests N=1, the one case where the stdlib approach
-is cheaper. Measured for N=32:
+| Values (N) | batched: 1 node | spread: N scopes |
+|---|---|---|
+| 1 | 37 ns | 37 ns |
+| 4 | 37 ns | 112 ns |
+| 8 | 38 ns | 213 ns |
+| 16 | 37 ns | 429 ns |
+| 32 | **37 ns** | **859 ns** |
 
-| Strategy | ns/op | B/op | allocs/op | context levels |
+And the cost of *building* those N values (N=32):
+
+| Strategy | ns/op | B/op | allocs/op | levels |
 |---|---|---|---|---|
-| `WithProviders(ctx, 32 provs)` | 2049 | 2456 | **6** | **1** |
-| 32× `WithProvider` | 9955 | 13312 | 160 | 32 |
-| 32× `context.WithValue` | **1452** | **1536** | 32 | 32 |
+| `WithProviders(ctx, 32)` | 2079 | 2488 | **6** | **1** |
+| 32× `WithProviders` (spread) | 9519 | 13824 | 128 | 32 |
+| 32× `UpdateProvider` (upsert) | 2896 | 512 | 32 | 1 |
+| 32× `context.WithValue` | **1418** | **1536** | 32 | 32 |
 
-Two honest findings fall out: batching via `WithProviders` is ~5x faster and
-~27x fewer allocs than the sequential `WithProvider` loop; and plain
-`context.WithValue` is cheaper in *raw ns and bytes* than plocal even at N=32 —
-plocal's advantage is **alloc count** (6 vs 32) and, above all, the **flat
-lookup shape** it buys. Naming the axis honestly means naming that trade.
+Three honest findings: batching keeps reads flat in N (one node, ~37 ns
+forever); batching beats spreading within plocal by ~5x in time and ~20x in
+allocs; and stdlib's **raw** injection ns/bytes remain lower even at N=32 —
+plocal's win is the **shape** (one level, bounded allocs, flat reads), not raw
+speed.
+
+**Gap 4 — the optimization that enabled the fast path introduced two defects.**
+The single-value `Provide` had been moved onto `context.WithValue(c, key, val)`
+with a `c.Value(key)` fast path in `Use()`, and `WithProvider`/`UpdateProvider`
+were made to mutate an existing node in place. Both changes are defects:
+
+1. **Data race.** Upserting into a node that was already handed out mutates a
+   shared `map[any]any`. Concurrent `Use(base, k)` + `WithProvider(base, …)`
+   races under `-race` (and concurrent map read/write can panic), violating the
+   documented concurrency guarantee of `Use()`.
+2. **Broken shadowing.** Because `Provide` stored its value as a direct stdlib
+   key, `Use()`'s fast path (checked first) made that value permanently shadow
+   any later `ProvideAll`/`WithProviders` override of the same key. No ordering
+   of the two lookups fixes both directions: a direct key and a registry node
+   live in two context chains with no relative-position information.
+
+Both defects are fixed in production code as part of this change: a
+`sync.RWMutex` guards each node, `Provide` goes back onto the registry, and
+`Use()` walks the registry only (no fast path). All injection orders then shadow
+correctly ("nearest scope wins").
 
 **Constraint:** absolute ns/op is machine- and thermal-dependent and is
-advisory. The load-bearing evidence is (a) alloc counts, which are stable, and
-(b) ratios measured within a single run.
+advisory. The load-bearing evidence is (a) alloc counts and level counts, which
+are stable, (b) the flat-vs-linear *shape* of reads as N grows, and (c) ratios
+measured within a single run.
 
 ## What Changes
 
 - **Rewrite `buildChain`** so it actually nests: `depth` sequential scope
-  creations, one node per level, with the sought key at the root. Fix its doc
-  comment and the false `// Build the chain iteratively...` comment.
+  creations, one node per level, with the sought key at the outer root. Fix its
+  doc comment and delete the false `// Build the chain iteratively...` comment.
+- **Fix the concurrency defect:** add a `sync.RWMutex` to `registryNode`,
+  locking reads in `Use()` and upsert writes in `WithProvider` /
+  `UpdateProvider` / `UpdateProviders`.
+- **Fix the shadowing defect:** put `Provide` back on the registry (one node per
+  call) and drop the `c.Value(key)` fast path from `Use()`, so all injection
+  paths compose into correct "nearest scope wins" shadowing.
+- **Reframe the story around injection width** (the library's real axis): N
+  values in one node keep reads flat; N scopes make them linear. Depth is
+  retained as an honest disclosure, not a headline.
 - **Re-measure every benchmark** and regenerate both the `api_bench_test.go`
   baseline comment block and the `README.md` results tables from the same run.
-- **Add an injection-cost sweep**: `WithProviders(N)` vs N× `WithProvider` vs
-  N× `context.WithValue` for N ∈ {1, 2, 4, 8, 16, 32}, reporting ns/op, B/op,
-  allocs/op, and resulting context depth.
-- **Add a lookup-after-injection pair**: worst-case read of the first-injected
-  key after injecting N values with each strategy, so the flat-vs-linear
-  consequence of the injection shape is visible (crossover at N≈4).
-- **Add a scope-override demonstration**: a test proving an inner scope
-  overrides a key locally without mutating the outer scope — the "local
-  override, not permanent replace" semantic — contrasted with the stdlib
-  equivalent that requires re-wrapping to scope.
-- **Invert and correct the narrative** in `README.md`: lead with flat
-  O(1)-in-depth lookup vs stdlib's O(depth), state the crossover (N≈4), and
-  state the N=1 and raw-ns cases where stdlib wins.
-- **Correct the `performance-benchmarks` spec**: the requirement "`Use()` lookup
-  time scales linearly with depth (O(depth))" is false for plocal (it is flat;
-  linearity describes stdlib) and must be rewritten. The requirement "plocal `Use`
-  is faster than stdlib for equivalent depth" must become conditional on depth.
+- **Add a width/read-after-injection pair** (`Read_Batched` vs `Read_Spread`) and
+  an **injection-cost sweep** (`WithProviders(N)` vs N× `WithProviders` vs N×
+  `UpdateProvider` vs N× `context.WithValue`) for N ∈ {1, 4, 8, 16, 32}.
+- **Add correctness tests**: scope-override semantics (inner shadows outer,
+  outer intact) for both the closure and derived-context APIs; upsert semantics
+  for `UpdateProvider`/`UpdateProviders`; and a concurrent upsert-vs-read race
+  test.
+- **Correct the `performance-benchmarks` spec**: the "linear in depth (flat for
+  plocal)" and unconditional-faster requirements are replaced with truthful ones
+  (depth is linear for plocal and stdlib is cheaper at every depth; the width
+  axis is where plocal wins; assert allocs/levels/shape, not fixed ns).
 
 ## Capabilities
 
 ### Modified Capabilities
 
-- `performance-benchmarks`: correct the depth-scaling requirement (plocal is
-  depth-*independent*, not linear), make the stdlib comparison conditional on
-  depth and state the crossover, and add requirements covering the injection-cost
-  comparison, the allocation-per-scope claim at N>1, and the scope-override
-  semantic.
+- `performance-benchmarks`: state the depth requirement truthfully (plocal is
+  linear in depth; stdlib is faster raw at every depth), add the width-axis
+  requirement (one node per scope; flat reads as N grows; batch beats spread),
+  add the injection-cost requirement, and add the scope-override requirement.
 
 ## Impact
 
+- **Production code:** `plocal/api.go`, `plocal/models.go` — mutex on
+  `registryNode`; `Use()` registry-only walk; `Provide` back on the registry;
+  documented `UpdateProvider`/`UpdateProviders`.
 - **Tests:** `plocal/api_bench_test.go` — rewrite `buildChain`, correct baseline
-  comments, add injection sweep, lookup-after-injection, and scope-override
-  benchmarks.
-- **Docs:** `README.md` — regenerate results tables; correct the "Key findings"
-  and the "Performance"/"Problem" narrative to match measurement.
+  comments, add width/read-after-injection/injection-cost benchmarks and harness
+  guards. `plocal/api_test.go` — scope-override, upsert, and race tests.
+- **Docs:** `README.md` — regenerate results tables; rewrite the pitch, Problem/
+  Solution prose, API reference, and Key findings to the corrected width thesis.
 - **Specs:** `openspec/specs/performance-benchmarks/spec.md` (via delta).
-- **No production code changes.** `plocal/api.go` and `plocal/models.go` are
-  correct; their behavior was mis-measured, not wrong.
-- **No new dependencies.** The comparison uses only `context`.
+- **No new dependencies.** The comparison uses only `context`; the guard uses
+  `sync`.
 - **Supersedes a claim** in the archived change
   `document-platform-example-and-stdlib-benchmarks`, which marked the
-  performance spec complete on numbers this change shows to be artifacts.
+  performance spec complete on a depth-based narrative.

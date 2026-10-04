@@ -49,43 +49,67 @@ func Value[T any](key *ResourceKey[T], val T) Provider {
 //	    next.ServeHTTP(w, r.WithContext(ctx))
 //	})
 func ProvideAll[T any](c context.Context, providers []Provider, consumer func(ctx context.Context) T) T {
-
-	// Create a map just for the new providers at this level
-	localVals := make(map[any]any, len(providers))
-	for _, p := range providers {
-		p.apply(localVals)
-	}
-
-	// Create the new tree node
-	node := &registryNode{
-		values: localVals,
-	}
-
-	// If a parent node exists, link to it (The Prototype Chain)
-	if parentNode, ok := c.Value(registryKey).(*registryNode); ok {
-		node.parent = parentNode
-	}
-
 	// Wrap the context once with our new leaf node
-	localCtx := context.WithValue(c, registryKey, node)
+	localCtx := WithProviders(c, providers)
 
 	return consumer(localCtx)
 }
 
-// Provide is a convenience wrapper around [ProvideAll] for injecting a single
-// key/value pair into a new scope. It is equivalent to:
+// Provide injects a single key/value pair into a new scope and calls consumer
+// with the enriched context. It is equivalent to:
 //
 //	plocal.ProvideAll(ctx, []plocal.Provider{plocal.Value(key, val)}, consumer)
 //
-// Use [ProvideAll] directly when injecting multiple values to avoid creating
-// one node per key.
+// Like [ProvideAll], the value is stored in a new registry node, so it shadows
+// shallower values for the same key and is itself shadowed by deeper ones
+// (nearest scope wins). Use [ProvideAll] directly when injecting several values
+// at once to avoid creating one node per key.
 func Provide[T, U any](c context.Context, key *ResourceKey[T], val T, consumer func(c context.Context) U) U {
 	return ProvideAll(c, []Provider{Value(key, val)}, consumer)
 }
 
+// UpdateProvider upserts a single provider into the current scope's node if one
+// exists, mutating that node in place (no new registry level) and returning the
+// same context. If no registry node exists yet, it creates one via
+// [WithProviders].
+//
+// The write is guarded by the node's lock, so it is safe to call concurrently
+// with [Use] on the same context. Note that upserting mutates a context that
+// may already have been shared: prefer [Provide]/[ProvideAll] for scope-local
+// injection and reach for Update* only when you intend to amend a live scope.
+func UpdateProvider(c context.Context, provider Provider) context.Context {
+	if node, ok := c.Value(registryKey).(*registryNode); ok {
+		node.mu.Lock()
+		provider.apply(node.values)
+		node.mu.Unlock()
+		return c
+	}
+	return WithProviders(c, []Provider{provider})
+}
+
+// UpdateProviders upserts several providers into the current scope's node if one
+// exists, mutating that node in place (no new registry level) and returning the
+// same context. If no registry node exists yet, it creates one via
+// [WithProviders]. Writes are lock-guarded, as with [UpdateProvider].
+func UpdateProviders(c context.Context, providers []Provider) context.Context {
+	if node, ok := c.Value(registryKey).(*registryNode); ok {
+		node.mu.Lock()
+		for _, p := range providers {
+			p.apply(node.values)
+		}
+		node.mu.Unlock()
+		return c
+	}
+	return WithProviders(c, providers)
+}
+
 // Use retrieves the typed value associated with key from the nearest enclosing
-// scope in the registry tree. It walks the Prototype Chain — from the current
-// leaf node up to the root — and returns the first matching value it finds.
+// scope. It walks the Prototype Chain — from the current leaf node up to the
+// root — and returns the first matching value it finds.
+//
+// Precedence is "nearest scope wins": a value injected in a deeper scope shadows
+// one injected in a shallower scope for the same key, regardless of whether it
+// was injected via [Provide], [ProvideAll], or [WithProviders].
 //
 // If key was never injected into any ancestor scope, Use returns the key's
 // default fallback (set when the key was created via [NewResourceKey]).
@@ -101,12 +125,10 @@ func Use[T any](c context.Context, key *ResourceKey[T]) T {
 		return key.Default()
 	}
 
-	// Find the leaf node in the standard context
+	// Walk the registry tree from the current leaf up to the root.
 	if node, ok := c.Value(registryKey).(*registryNode); ok {
-
-		// Walk up our fast-lane registry tree
 		for curr := node; curr != nil; curr = curr.parent {
-			if val, exists := curr.values[key]; exists {
+			if val, exists := curr.get(key); exists {
 				return val.(T)
 			}
 		}
@@ -115,12 +137,23 @@ func Use[T any](c context.Context, key *ResourceKey[T]) T {
 	return key.Default()
 }
 
+// WithProvider injects a single key/value pair and returns the enriched context.
+//
+// If the current scope already exists and does not yet contain key, the pair is
+// merged into that scope's node in place (no new level) — so a run of
+// WithProvider calls for distinct keys stays at one registry level. If key is
+// already present, a new shadowing node is pushed so the override is scoped.
+// When no registry node exists yet, a new node is created.
 func WithProvider[T any](c context.Context, key *ResourceKey[T], val T) context.Context {
+	if parentNode, ok := c.Value(registryKey).(*registryNode); ok {
+		if !parentNode.has(key) {
+			return UpdateProvider(c, Value(key, val))
+		}
+	}
 	return WithProviders(c, []Provider{Value(key, val)})
 }
 
 func WithProviders(c context.Context, providers []Provider) context.Context {
-
 	// Create a map just for the new providers at this level
 	localVals := make(map[any]any, len(providers))
 	for _, p := range providers {

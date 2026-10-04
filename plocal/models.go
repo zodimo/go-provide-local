@@ -1,14 +1,47 @@
 package plocal
 
+import "sync"
+
 type registryContextKey struct{}
 
 var registryKey = registryContextKey{}
 
 // registryNode is a single node in the Prototype Chain.
 // It holds only the values injected at one particular ProvideAll call site.
+//
+// mu guards values against concurrent access. Most nodes are written once at
+// creation and then only read, but the upsert paths (UpdateProvider /
+// UpdateProviders, and WithProvider when it merges into the current scope)
+// mutate an existing node's map in place, so readers take RLock and writers
+// Lock. This preserves the "safe to call concurrently" guarantee of [Use]
+// even when a derived context upserts into a shared parent.
 type registryNode struct {
+	mu     sync.RWMutex
 	parent *registryNode
 	values map[any]any // Only holds values injected at this specific level
+}
+
+// get reads a value from this node under the read lock.
+func (n *registryNode) get(key any) (any, bool) {
+	n.mu.RLock()
+	val, ok := n.values[key]
+	n.mu.RUnlock()
+	return val, ok
+}
+
+// has reports whether key is present in this node under the read lock.
+func (n *registryNode) has(key any) bool {
+	n.mu.RLock()
+	_, ok := n.values[key]
+	n.mu.RUnlock()
+	return ok
+}
+
+// put writes a value into this node under the write lock.
+func (n *registryNode) put(key, val any) {
+	n.mu.Lock()
+	n.values[key] = val
+	n.mu.Unlock()
 }
 
 type providerImpl[T any] struct {
