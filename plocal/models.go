@@ -1,47 +1,85 @@
 package plocal
 
-import "sync"
-
 type registryContextKey struct{}
 
 var registryKey = registryContextKey{}
 
+// entry is one key/value pair stored in a node. Keys are *ResourceKey[T]
+// addresses, so identity is a pointer compare — no interface hashing.
+type entry struct {
+	key any
+	val any
+}
+
 // registryNode is a single node in the Prototype Chain.
 // It holds only the values injected at one particular ProvideAll call site.
 //
-// mu guards values against concurrent access. Most nodes are written once at
-// creation and then only read, but the upsert paths (UpdateProvider /
-// UpdateProviders, and WithProvider when it merges into the current scope)
-// mutate an existing node's map in place, so readers take RLock and writers
-// Lock. This preserves the "safe to call concurrently" guarantee of [Use]
-// even when a derived context upserts into a shared parent.
+// Invariant: a node is immutable after construction. entries is fixed when the
+// node is built and is never mutated afterwards. Upsert paths
+// (UpdateProvider / UpdateProviders, and WithProvider when it merges into the
+// current scope) construct a *new* node carrying the amended entry set rather
+// than writing into an existing one.
+//
+// Because entries never change, [Use] needs no lock: a reader traversing a
+// chain can never observe a partially written node, so concurrent reads and
+// concurrent upserts are race-free by construction.
+//
+// Storage is a pointer-keyed slice scanned linearly rather than a
+// map[any]any. Probes are pointer compares instead of interface hashes, and
+// the entries are contiguous. The trade-off is that the worst-case read inside
+// a single node grows with the node's entry count (crossover around ~16
+// entries per node); see the package documentation for the soft cap.
 type registryNode struct {
-	mu     sync.RWMutex
-	parent *registryNode
-	values map[any]any // Only holds values injected at this specific level
+	parent  *registryNode
+	entries []entry // Only holds values injected at this specific level
 }
 
-// get reads a value from this node under the read lock.
+// get reads a value from this node. It scans entries by pointer compare and
+// is lock-free: entries is immutable after construction.
 func (n *registryNode) get(key any) (any, bool) {
-	n.mu.RLock()
-	val, ok := n.values[key]
-	n.mu.RUnlock()
-	return val, ok
+	for i := range n.entries {
+		if n.entries[i].key == key {
+			return n.entries[i].val, true
+		}
+	}
+	return nil, false
 }
 
-// has reports whether key is present in this node under the read lock.
+// has reports whether key is present in this node. Lock-free, as with [get].
 func (n *registryNode) has(key any) bool {
-	n.mu.RLock()
-	_, ok := n.values[key]
-	n.mu.RUnlock()
-	return ok
+	for i := range n.entries {
+		if n.entries[i].key == key {
+			return true
+		}
+	}
+	return false
 }
 
-// put writes a value into this node under the write lock.
-func (n *registryNode) put(key, val any) {
-	n.mu.Lock()
-	n.values[key] = val
-	n.mu.Unlock()
+// with returns a new node carrying this node's entries plus the given ones.
+// A given entry whose key is already present replaces the existing binding
+// rather than being appended, so upsert cannot produce duplicate keys. The
+// receiver is left unmodified — this is how upsert avoids mutating a node a
+// concurrent reader may be traversing (copy-on-upsert).
+func (n *registryNode) with(extra ...entry) *registryNode {
+	entries := make([]entry, 0, len(n.entries)+len(extra))
+	entries = append(entries, n.entries...)
+	for _, e := range extra {
+		replaced := false
+		for i := range entries {
+			if entries[i].key == e.key {
+				entries[i] = e
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			entries = append(entries, e)
+		}
+	}
+	return &registryNode{
+		parent:  n.parent,
+		entries: entries,
+	}
 }
 
 type providerImpl[T any] struct {
@@ -49,8 +87,9 @@ type providerImpl[T any] struct {
 	val T
 }
 
-func (p providerImpl[T]) apply(m map[any]any) {
-	m[p.key] = p.val
+// asEntry converts the provider into the key/value pair it contributes.
+func (p providerImpl[T]) asEntry() entry {
+	return entry{key: p.key, val: p.val}
 }
 
 // ResourceKey is a typed, collision-proof context key for values of type T.

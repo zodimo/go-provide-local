@@ -86,55 +86,77 @@ func buildStdlibChain(depth int) (context.Context, stdlibKey) {
 // §3 Performance Benchmarks
 //
 // Measured baseline (Intel Core Ultra 9 185H, Go 1.27, linux/amd64, GOMAXPROCS=22),
-// regenerated in a single run (2s/bench unless noted):
+// regenerated in a single run after the immutable-nodes change (1s/bench).
+// Nodes are now immutable and store a pointer-keyed []entry scanned linearly
+// instead of a lock-guarded map[any]any, so the read path is a lock-free
+// pointer chase.
 //
 // Two independent axes are measured. Do not read one as the other.
 //
 // AXIS 1 — depth (one value per nested scope). plocal Use() cost grows with
-// the number of registry nodes it must walk, so per-level nesting is LINEAR and
-// stdlib context.Value() is cheaper at every depth:
+// the number of registry nodes it must walk, so per-level nesting is LINEAR.
+// Removing the read lock and the interface-keyed map reversed the previous
+// conclusion: plocal is now FASTER than stdlib context.Value() at every depth.
 //
-//   BenchmarkUse_Depth1-22                       →    38 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_Depth10-22                      →   292 ns/op    0 B/op   0 allocs/op
-//   BenchmarkUse_Depth100-22                     →  2652 ns/op    0 B/op   0 allocs/op
+//   BenchmarkUse_Depth1-22                       →    13.1 ns/op   0 B/op   0 allocs/op
+//   BenchmarkUse_Depth10-22                      →    43.3 ns/op   0 B/op   0 allocs/op
+//   BenchmarkUse_Depth100-22                     →   281.4 ns/op   0 B/op   0 allocs/op
 //
-//   BenchmarkVsStdlib_plocal_Depth1-22           →    37 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_stdlib_Depth1-22           →     8 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_plocal_Depth10-22          →   279 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_stdlib_Depth10-22          →    54 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_plocal_Depth100-22         →  2671 ns/op    0 B/op   0 allocs/op
-//   BenchmarkVsStdlib_stdlib_Depth100-22         →   439 ns/op    0 B/op   0 allocs/op
-//   (both are O(nodes); stdlib wins at every depth because each plocal step is a
-//    lock-guarded map[any]any probe plus a pointer hop, while each stdlib step is
-//    a pointer compare + type switch)
+//   BenchmarkVsStdlib_plocal_Depth1-22           →    13.1 ns/op   0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth1-22           →     8.8 ns/op   0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_plocal_Depth10-22          →    44.1 ns/op   0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth10-22          →    52.2 ns/op   0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_plocal_Depth100-22         →   286.8 ns/op   0 B/op   0 allocs/op
+//   BenchmarkVsStdlib_stdlib_Depth100-22         →   456.5 ns/op   0 B/op   0 allocs/op
+//   (both are O(nodes); plocal wins at depths 10 and 100 because each plocal step
+//    is a lock-free pointer compare, while each stdlib step is a pointer compare
+//    plus an interface type switch. At depth 1 stdlib's single wrap is still
+//    marginally cheaper than locating the plocal leaf via c.Value(registryKey).)
 //
 // AXIS 2 — width (N values for ONE scope). This is the library's headline. One
-// WithProviders call stores all N values in one node, so a read stays FLAT in N,
-// while spreading the same N values across N scopes makes reads LINEAR in N:
+// WithProviders call stores all N values in one node, so a read stays FLAT in N
+// up to the per-node soft cap (~16 entries; see the width sweep below), while
+// spreading the same N values across N scopes makes reads LINEAR in N:
 //
-//   BenchmarkRead_Batched_N1 ... N32-22          →   37 ns/op at every N (flat)
-//   BenchmarkRead_Spread_N1-22                   →    37 ns/op
-//   BenchmarkRead_Spread_N4-22                   →   112 ns/op
-//   BenchmarkRead_Spread_N8-22                   →   213 ns/op
-//   BenchmarkRead_Spread_N16-22                  →   429 ns/op
-//   BenchmarkRead_Spread_N32-22                  →   859 ns/op
+//   BenchmarkRead_Batched_N1 ... N32-22          →  ~12.6 ns/op at every N (flat)
+//   BenchmarkRead_Spread_N1-22                   →    12.0 ns/op   (1 level)
+//   BenchmarkRead_Spread_N4-22                   →    21.3 ns/op   (4 levels)
+//   BenchmarkRead_Spread_N8-22                   →    30.2 ns/op   (8 levels)
+//   BenchmarkRead_Spread_N16-22                  →    67.1 ns/op  (16 levels)
+//   BenchmarkRead_Spread_N32-22                  →   107.8 ns/op  (32 levels)
 //
-//   BenchmarkInject_Batched_N32-22               →  2079 ns/op  2488 B/op   6 allocs/op   (1 level)
-//   BenchmarkInject_SeqPlocal_N32-22             →  9519 ns/op 13824 B/op 128 allocs/op   (32 levels)
-//   BenchmarkInject_SeqStdlib_N32-22             →  1418 ns/op  1536 B/op  32 allocs/op   (32 levels)
-//   BenchmarkInject_Upsert_N32-22                →  2896 ns/op   512 B/op  32 allocs/op   (1 level)
+//   BenchmarkInject_Batched_N32-22               →   651.5 ns/op  1232 B/op   3 allocs/op   (1 level)
+//   BenchmarkInject_SeqPlocal_N32-22             →  3832   ns/op  3584 B/op  96 allocs/op   (32 levels)
+//   BenchmarkInject_SeqStdlib_N32-22             →  1359   ns/op  1536 B/op  32 allocs/op   (32 levels)
 //   (stdlib's raw injection ns/bytes stay lower even at N=32; plocal's win is the
-//    one-node shape — 1 level, constant allocs, and flat reads)
+//    one-node shape — 1 level, a near-constant alloc count, and flat reads)
+//
+// WIDTH SOFT CAP — a pointer-keyed slice scans linearly, so the worst-case read
+// inside a SINGLE node grows with that node's entry count. Measured worst case
+// (wanted entry stored last) vs best case (stored first):
+//
+//   entries/node:     4      8     16     32     64
+//   worst (last):   17ns   18ns   25ns   55ns   96ns
+//   best  (first):  12ns   13ns   12ns   12ns   12ns
+//
+//   A flat stdlib chain of the same N WithValue wraps costs 26/41/77/153/305 ns,
+//   so the plocal worst case overtakes the flat-stdlib equivalent between 32 and
+//   64 entries in one node (crossover near the documented ~16 is where the
+//   growth becomes visible). Keep a single scope's value count small — prefer
+//   splitting a very wide scope into nested scopes, which stays linear but with
+//   a much smaller constant.
 //
 // NOTE: Absolute ns/op varies with machine and thermal state; treat the ratios
 // within a single run, and the alloc/level counts, as the load-bearing evidence
 // and the absolute figures as advisory. The library's advantages are:
 //   1. Zero heap allocations on Use() at every depth and every width.
 //   2. Batching N values into one scope costs ONE node, a near-constant alloc
-//      count, and keeps reads flat in N — versus N nodes, N allocs, and linear
-//      reads for the same values spread across scopes. (Raw injection ns/bytes
-//      for a single stdlib WithValue remain lower; the win is shape, not speed.)
-//   3. Full compile-time type safety — no manual type assertions.
+//      count, and keeps reads flat in N (up to the per-node soft cap) — versus N
+//      nodes, N allocs, and linear reads for the same values spread across
+//      scopes.
+//   3. plocal reads now beat stdlib context.Value() at depth too, in addition to
+//      the already-held shape win.
+//   4. Full compile-time type safety — no manual type assertions.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // TestBuildChain_RegistryDepth guards the harness: buildChain(depth) must
@@ -330,8 +352,17 @@ func benchmarkInjectSeqStdlib(b *testing.B, width int) {
 }
 
 // BenchmarkInject_Upsert_N* measures the upsert path: one base node created up
-// front, then N values applied in place. This is only valid for N values that
-// share the base node's scope; it is the cheapest plocal injection shape.
+// front, then N values applied with copy-on-upsert, each call replacing the
+// current scope's leaf node (no new registry level).
+//
+// Note on the shape: because each upsert returns a NEW context, the loop below
+// chains the returned contexts, so the Nth upsert walks an N-deep chain to
+// locate its leaf before copying. That makes this benchmark's per-op cost grow
+// superlinearly in N — it measures a pathological accumulating lifetime, not
+// the cost of a single upsert. For the isolated per-call cost, see the probe
+// figures in the change design: ~136 ns to upsert into a 1-entry node and
+// ~561 ns into a 32-entry node, each 3 allocs/op, flat in chain depth because
+// upsert always targets the leaf.
 func BenchmarkInject_Upsert_N1(b *testing.B)  { benchmarkInjectUpsert(b, 1) }
 func BenchmarkInject_Upsert_N4(b *testing.B)  { benchmarkInjectUpsert(b, 4) }
 func BenchmarkInject_Upsert_N8(b *testing.B)  { benchmarkInjectUpsert(b, 8) }

@@ -19,7 +19,9 @@
 // links it to the parent — no map copying, no GC spikes.
 //
 // Value lookups via [Use] traverse only the injected dependency nodes, skipping
-// all standard library timeout/cancellation wrappers entirely.
+// all standard library timeout/cancellation wrappers entirely. A node's entry
+// storage is immutable after construction, so [Use] takes no lock: each step is
+// a lock-free pointer compare over a pointer-keyed slice.
 //
 // # Quick Start
 //
@@ -54,6 +56,12 @@
 //
 //	scopedCtx := plocal.WithProvider(ctx, RequestIDKey, "req-abc-123")
 //	scopedCtx = plocal.WithProviders(scopedCtx, providers)
+//
+// [UpdateProvider] and [UpdateProviders] amend the current scope's node. They
+// are copy-on-upsert: a new node is constructed and the context you pass in is
+// left unmodified, so upsert never mutates state a concurrent reader may be
+// traversing. Use the returned context — it is the one that reflects the
+// change.
 //
 // The scope-lifetime difference matters. A closure scope is released the
 // instant the consumer returns and can never outlive it. A context returned by

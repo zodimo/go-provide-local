@@ -410,9 +410,11 @@ func TestWithProvider_NewKey_MergesIntoCurrentScope(t *testing.T) {
 // §4 Upsert (UpdateProvider / UpdateProviders)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 4.1 UpdateProvider overwrites a value in the current scope's node and returns
-// the same context (no new level), and the new value is visible via Use.
-func TestUpdateProvider_OverwritesInPlace(t *testing.T) {
+// 4.1 UpdateProvider overwrites the value in the current scope (no new level)
+// and returns a context that resolves the new value. The upsert is
+// copy-on-upsert: the returned context carries a newly constructed node, and
+// the context passed in keeps resolving its original value.
+func TestUpdateProvider_OverwritesWithoutMutatingSource(t *testing.T) {
 	key := NewResourceKey[string]("default")
 
 	ctx := WithProviders(context.Background(), []Provider{Value(key, "original")})
@@ -426,10 +428,10 @@ func TestUpdateProvider_OverwritesInPlace(t *testing.T) {
 	if got := Use(updated, key); got != "updated" {
 		t.Errorf("after UpdateProvider: expected %q, got %q", "updated", got)
 	}
-	// Upsert mutates the existing node in place, so the same context value
-	// reflects the change (that is the documented semantics).
-	if got := Use(ctx, key); got != "updated" {
-		t.Errorf("original context after in-place upsert: expected %q, got %q", "updated", got)
+	// The source node is never mutated, so the context we upserted from still
+	// resolves its original value (copy-on-upsert semantics).
+	if got := Use(ctx, key); got != "original" {
+		t.Errorf("source context after upsert: expected %q, got %q", "original", got)
 	}
 }
 
@@ -447,7 +449,8 @@ func TestUpdateProvider_NoNode_FallsBackToNewNode(t *testing.T) {
 	}
 }
 
-// 4.3 UpdateProviders upserts several keys into the current node at once.
+// 4.3 UpdateProviders upserts several keys into the current scope at once.
+// A key already in the node is overwritten; one absent from it is added.
 func TestUpdateProviders_UpsertsMultiple(t *testing.T) {
 	k1 := NewResourceKey[int](0)
 	k2 := NewResourceKey[string]("d")
@@ -472,7 +475,9 @@ func TestUpdateProviders_UpsertsMultiple(t *testing.T) {
 }
 
 // 4.4 Upsert must be data-race free against concurrent Use() on the same
-// shared parent context. Run with -race.
+// shared parent context. Run with -race. Because upsert is copy-on-upsert,
+// the shared base node is never mutated, so concurrent reads cannot observe
+// a torn state.
 func TestUpsert_ConcurrentWithUse_NoRace(t *testing.T) {
 	readKey := NewResourceKey[int](-1)
 	base := WithProviders(context.Background(), []Provider{Value(readKey, 7)})
@@ -481,7 +486,8 @@ func TestUpsert_ConcurrentWithUse_NoRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Reader goroutine: repeatedly read the shared base context.
+	// Reader goroutine: repeatedly read the shared base context. The base node
+	// is immutable, so this must remain 7 throughout.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
@@ -492,7 +498,8 @@ func TestUpsert_ConcurrentWithUse_NoRace(t *testing.T) {
 		}
 	}()
 
-	// Writer goroutine: upsert new distinct keys into the same node.
+	// Writer goroutine: upsert new distinct keys into the same scope, each
+	// time deriving a fresh context from the shared base.
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
@@ -501,4 +508,104 @@ func TestUpsert_ConcurrentWithUse_NoRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// 4.5 Upserting a derived context leaves the parent context resolving its
+// original value (copy-on-upsert, not mutation of shared node state).
+func TestUpdateProvider_DerivedUpsertLeavesParentIntact(t *testing.T) {
+	keyA := NewResourceKey[string]("a-default")
+	keyB := NewResourceKey[string]("b-default")
+
+	parent := WithProviders(context.Background(), []Provider{Value(keyA, "parent-a")})
+	parentDepth := chainDepth(parent)
+
+	// Derive a scope from the parent and upsert onto it.
+	derived := WithProviders(parent, []Provider{Value(keyB, "derived-b")})
+	upserted := UpdateProviders(derived, []Provider{Value(keyA, "derived-a")})
+
+	if got := Use(upserted, keyA); got != "derived-a" {
+		t.Errorf("upserted derived scope: expected %q for keyA, got %q", "derived-a", got)
+	}
+	if got := Use(upserted, keyB); got != "derived-b" {
+		t.Errorf("upserted derived scope: expected %q for keyB, got %q", "derived-b", got)
+	}
+	// Upsert added no new level beyond the derived scope's own.
+	if got := chainDepth(upserted); got != parentDepth+1 {
+		t.Errorf("upserted derived scope: registry depth = %d, want %d", got, parentDepth+1)
+	}
+
+	// The parent resolves its original value for the upserted key.
+	if got := Use(parent, keyA); got != "parent-a" {
+		t.Errorf("parent after derived upsert: expected %q, got %q", "parent-a", got)
+	}
+	// And it never saw keyB, which was injected only in the derived scope.
+	if got := Use(parent, keyB); got != "b-default" {
+		t.Errorf("parent after derived upsert: expected fallback %q for keyB, got %q", "b-default", got)
+	}
+	// The derived (pre-upsert) context is likewise unchanged.
+	if got := Use(derived, keyA); got != "parent-a" {
+		t.Errorf("derived context before upsert still expected %q for keyA, got %q", "parent-a", got)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// §5 Immutability of node storage
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 5.1 Construction sizes entry storage exactly: a node built from N providers
+// holds exactly N entries, and Lookup never reports a key that was not injected
+// at that node.
+func TestNodeStorage_HoldsExactlyInjectedEntries(t *testing.T) {
+	k1 := NewResourceKey[string]("d1")
+	k2 := NewResourceKey[int](0)
+	k3 := NewResourceKey[bool](false)
+	absent := NewResourceKey[string]("absent")
+
+	ctx := WithProviders(context.Background(), []Provider{
+		Value(k1, "one"),
+		Value(k2, 2),
+		Value(k3, true),
+	})
+
+	node := ctx.Value(registryKey).(*registryNode)
+	if len(node.entries) != 3 {
+		t.Errorf("node entries = %d, want 3", len(node.entries))
+	}
+	if cap(node.entries) != 3 {
+		t.Errorf("node entries capacity = %d, want 3 (sized exactly, must not grow)", cap(node.entries))
+	}
+	if node.has(absent) {
+		t.Errorf("node reports a key that was never injected at this node")
+	}
+	if got := Use(ctx, absent); got != "absent" {
+		t.Errorf("uninjected key: expected fallback %q, got %q", "absent", got)
+	}
+}
+
+// 5.2 Upsert replaces rather than appends: re-upserting an existing key does not
+// grow the entry set, and a merged new key adds exactly one entry.
+func TestNodeStorage_UpsertDoesNotDuplicateEntries(t *testing.T) {
+	k1 := NewResourceKey[int](0)
+	k2 := NewResourceKey[string]("d")
+
+	ctx := WithProviders(context.Background(), []Provider{Value(k1, 1)})
+
+	same := UpdateProvider(ctx, Value(k1, 2))
+	if got := len(same.Value(registryKey).(*registryNode).entries); got != 1 {
+		t.Errorf("re-upserting an existing key: entries = %d, want 1", got)
+	}
+	if got := Use(same, k1); got != 2 {
+		t.Errorf("re-upserted key: expected 2, got %d", got)
+	}
+
+	merged := UpdateProvider(ctx, Value(k2, "added"))
+	if got := len(merged.Value(registryKey).(*registryNode).entries); got != 2 {
+		t.Errorf("upserting a new key: entries = %d, want 2", got)
+	}
+	if got := Use(merged, k1); got != 1 {
+		t.Errorf("pre-existing key after merge: expected 1, got %d", got)
+	}
+	if got := Use(merged, k2); got != "added" {
+		t.Errorf("merged key: expected %q, got %q", "added", got)
+	}
 }

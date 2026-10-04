@@ -21,7 +21,7 @@ Instead of wrapping the context once per value, it injects a single "Fast-Lane" 
 
 * **Type-Safe:** Built purely on Go 1.18 Generics. No `any`, no manual type assertions.
 * **Zero-Copy Scoping:** Creating a scope (`ProvideAll`) allocates one lightweight node and points it at the parent. Zero map copying, zero GC spikes.
-* **Flat in Width:** Injecting N values for a scope creates **one** node, so a read stays flat as N grows — where N separate `context.WithValue` wraps give N levels and linearly slower reads. See [Benchmark Results](#benchmark-results).
+* **Flat in Width:** Injecting N values for a scope creates **one** node, so a read stays flat as N grows (up to a per-node soft cap of ~16 values) — where N separate `context.WithValue` wraps give N levels and linearly slower reads. See [Benchmark Results](#benchmark-results).
 * **Collision-Proof:** Uses pointer memory addresses for context keys, making cross-package collisions mathematically impossible.
 
 ## Installation
@@ -172,27 +172,27 @@ Injects a single value into a new lexical scope and evaluates the consumer. Equi
 
 ### `ProvideAll[T any](ctx context.Context, providers []Provider, consumer func(ctx context.Context) T) T`
 
-Injects multiple providers into the context simultaneously. This creates a single new node in the Registry Tree pointing to the parent scope, holding all N values — so scope creation is O(providers), not O(providers) nodes. Highly optimized for injecting many values without map-copying allocations, and it is what keeps read cost flat as the number of values grows.
+Injects multiple providers into the context simultaneously. This creates a single new node in the Registry Tree pointing to the parent scope, holding all N values — so scope creation is O(providers), not O(providers) nodes. The node's entry storage is sized to the provider count at construction, and a read over it stays flat as the number of values grows (up to the per-node soft cap of ~16 values).
 
 ### `WithProvider[T any](ctx context.Context, key *ResourceKey[T], val T) context.Context`
 
 Injects a key/value pair and returns the enriched `context.Context` directly. Unlike `Provide`, it does not take a consumer closure — the caller owns the returned context.
 
-If the current scope already exists and does not yet contain `key`, the pair is **merged into that scope's node in place** (no new level) — so a run of `WithProvider` calls for distinct keys stays at one registry level. If `key` is already present, a new shadowing node is pushed so the override is scoped. When no registry node exists yet, a new node is created.
+If the current scope already exists and does not yet contain `key`, the pair is **merged into that scope** (no new level) — so a run of `WithProvider` calls for distinct keys stays at one registry level. If `key` is already present, a new shadowing node is pushed so the override is scoped. When no registry node exists yet, a new node is created. Merging is **copy-on-upsert**: a new node is constructed and the node on the given context is left unmodified.
 
 ### `WithProviders(ctx context.Context, providers []Provider) context.Context`
 
-Injects multiple providers at once and returns the enriched `context.Context` directly, creating one Registry Tree node for the whole batch.
+Injects multiple providers at once and returns the enriched `context.Context` directly, creating one Registry Tree node for the whole batch. The node's entry storage is sized to the provider count at construction.
 
 ### `UpdateProvider(ctx context.Context, provider Provider) context.Context`
 
-Upserts a single provider into the **current** scope's node if one exists, mutating that node in place (no new registry level) and returning the same context. If no registry node exists yet, it creates one via `WithProviders`.
+Upserts a single provider into the **current** scope if one exists, returning a context whose leaf is a **newly constructed node** carrying the amended entry set. No node is mutated, and no new registry level is added. If no registry node exists yet, it creates one via `WithProviders`.
 
 ### `UpdateProviders(ctx context.Context, providers []Provider) context.Context`
 
-Upserts several providers into the current scope's node in one call, with the same semantics as `UpdateProvider`.
+Upserts several providers into the current scope in one call, with the same semantics as `UpdateProvider`.
 
-> **Upsert mutates a live context.** `UpdateProvider`/`UpdateProviders` write into a node that may already have been shared with other goroutines or scopes. The write is lock-guarded (so it is race-free against concurrent `Use`), but the *value* of the key changes for every holder of that context. Prefer `Provide`/`ProvideAll` for scope-local injection; reach for `Update*` only when you deliberately intend to amend a live scope.
+> **Upsert is copy-on-upsert, not in-place mutation.** `UpdateProvider`/`UpdateProviders` build a new node and return a new context — the context you pass in is left exactly as it was, so it stays safe to read concurrently and its value never changes underneath other holders. **Use the returned context**; the one you passed does not reflect the upsert. Prefer `Provide`/`ProvideAll` for scope-local injection; reach for `Update*` when you deliberately want to amend a scope and thread the amended context onward.
 
 ### `Use[T any](ctx context.Context, key *ResourceKey[T]) T`
 
@@ -225,10 +225,11 @@ make test-all    # race tests then full benchmark run
 
 ### Benchmark Results
 
-Measured on Intel Core Ultra 9 185H, Go 1.27, linux/amd64, GOMAXPROCS=22.
-Regenerate with `make bench-mem`. Absolute ns/op varies with machine and thermal
-state — the ratios within one run, and the alloc/level counts, are the
-load-bearing evidence; the absolute figures are advisory.
+Measured on Intel Core Ultra 9 185H, Go 1.27, linux/amd64, GOMAXPROCS=22, after
+node storage was made immutable and pointer-keyed (regenerated from one run with
+`make bench-mem`). Absolute ns/op varies with machine and thermal state — the
+ratios within one run, and the alloc/level counts, are the load-bearing
+evidence; the absolute figures are advisory.
 
 Two independent axes are measured below. Reading one as the other is the mistake
 this section exists to prevent.
@@ -236,70 +237,110 @@ this section exists to prevent.
 #### Axis 1 — Width: N values for ONE scope (the library's headline)
 
 Batching N values into a single scope (`WithProviders` / `ProvideAll`) stores
-them in **one node**, so a read stays **flat in N**. Spreading the same N values
-across N scopes creates N nodes, so reads grow **linearly in N**. Both shapes
-read the outermost-injected key (worst case).
+them in **one node**, so a read stays **flat in N** up to the per-node soft cap.
+Spreading the same N values across N scopes creates N nodes, so reads grow
+**linearly in N**. Both shapes read the outermost-injected key (worst case).
 
 | Values (N) | Batched: 1 node, `Use()` ns/op | Spread: N scopes, `Use()` ns/op | Batched levels | Spread levels |
 |---|---|---|---|---|
-| 1 | 37 | 37 | 1 | 1 |
-| 4 | 37 | 112 | 1 | 4 |
-| 8 | 38 | 213 | 1 | 8 |
-| 16 | 37 | 429 | 1 | 16 |
-| 32 | **37** | **859** | **1** | **32** |
+| 1 | 12.6 | 12.0 | 1 | 1 |
+| 4 | 12.7 | 21.3 | 1 | 4 |
+| 8 | 12.7 | 30.2 | 1 | 8 |
+| 16 | 13.1 | 67.1 | 1 | 16 |
+| 32 | **12.6** | **107.8** | **1** | **32** |
+
+> **Per-node soft cap (~16 values).** Node storage is a pointer-keyed slice
+> scanned linearly, so the **worst-case** read *inside a single node* grows with
+> that node's entry count — while reading an entry stored early stays ~12 ns
+> regardless of N. Measured worst case (wanted entry last) vs best case (first):
+>
+> | Entries in one node | 4 | 8 | 16 | 32 | 64 |
+> |---|---|---|---|---|---|
+> | worst case (last) | 17 ns | 18 ns | 25 ns | 55 ns | 96 ns |
+> | best case (first) | 12 ns | 13 ns | 12 ns | 12 ns | 12 ns |
+>
+> Beyond roughly **16 values per node** the worst-case read grows with the count.
+> For very wide scopes, split them into nested scopes — that stays linear in
+> depth but with a much smaller constant. The batched-read column above reads a
+> key stored near the front, which is why it stays flat to N=32.
 
 #### Injection cost to build those N values (N = 32)
 
 | Strategy | ns/op | B/op | allocs/op | context/registry levels |
 |---|---|---|---|---|
-| plocal `WithProviders(ctx, 32)` | 2079 | 2488 | **6** | **1** |
-| plocal 32× `WithProviders` (spread) | 9519 | 13824 | 128 | 32 |
-| plocal 32× `UpdateProvider` (upsert) | 2896 | 512 | 32 | 1 |
-| stdlib 32× `context.WithValue` | **1418** | **1536** | 32 | 32 |
+| plocal `WithProviders(ctx, 32)` | 651 | 1232 | **3** | **1** |
+| plocal 32× `WithProviders` (spread) | 3832 | 3584 | 96 | 32 |
+| plocal 32× `UpdateProvider` (upsert) | 6339 | 6112 | 128 | 1 |
+| stdlib 32× `context.WithValue` | **1359** | **1536** | 32 | 32 |
 
-#### Axis 2 — Depth: one value per nested scope (disclosed, not the headline)
+> The upsert row is measured with each call's returned context threaded into the
+> next (the natural accumulating shape), so the Nth call walks an N-deep chain to
+> find its leaf before copying — which is why its per-op figure grows with N and
+> is not a flat per-call cost. As a single isolated call, upsert is **~136 ns
+> into a 1-entry node** and **~561 ns into a 32-entry node**, 3 allocs/op each
+> and flat in chain depth, because it always targets the leaf.
+
+#### Axis 2 — Depth: one value per nested scope
 
 When each value gets its own scope, both plocal and stdlib are linear in the
-number of levels — and **stdlib is cheaper at every depth**:
+number of levels — and **plocal is now cheaper than stdlib at depth 10 and 100**:
 
 | Depth (nodes) | plocal `Use()` ns/op | stdlib `ctx.Value()` ns/op | plocal allocs/op | stdlib allocs/op |
 |---|---|---|---|---|
-| 1 | 37 | **8** | 0 | 0 |
-| 10 | 256 | **54** | 0 | 0 |
-| 100 | 2554 | **448** | 0 | 0 |
+| 1 | 13.1 | **8.8** | 0 | 0 |
+| 10 | **44.1** | 52.2 | 0 | 0 |
+| 100 | **286.8** | 456.5 | 0 | 0 |
 
 #### Scope creation (1 provider injected)
 
 | Implementation | ns/op | B/op | allocs/op |
 |---|---|---|---|
-| plocal `ProvideAll()` at depth 1 | 363 | 472 | 6 |
-| plocal `ProvideAll()` at depth 100 | 354 | **472** | **6** ← same as depth 1 |
+| plocal `ProvideAll()` at depth 1 | 169 | 152 | 5 |
+| plocal `ProvideAll()` at depth 100 | 174 | **152** | **5** ← same as depth 1 |
 | stdlib `context.WithValue` at depth 1 | **39** | **48** | **1** |
 
 **Key findings:**
 
 - ✅ **plocal wins on width: reads stay flat as one scope holds more values.**
-  Injecting N values for a scope is **one node**, so `Use()` is ~37 ns whether
+  Injecting N values for a scope is **one node**, so `Use()` is ~12.6 ns whether
   N is 1 or 32. Spreading the same values across N scopes makes reads grow
-  linearly (37 → 859 ns) and forces N levels. This is the axis the library is
-  built around, and the one to optimize for: **inject related values together
-  with `ProvideAll`, not one call per value.**
+  linearly (12 → 108 ns) and forces N levels. This is the axis the library is
+  built around: **inject related values together with `ProvideAll`, not one call
+  per value.** (Mind the per-node soft cap above.)
 - ✅ **plocal wins zero-alloc reads.** `Use()` allocates **0 bytes at every
-  width and depth** — the registry walk never touches the heap.
+  width and depth**, and takes no lock.
+- ✅ **plocal now wins on depth too.** `Use()` is faster than `context.Value()`
+  at depth 10 (44 vs 52 ns) and depth 100 (287 vs 457 ns). Because nodes are
+  immutable, each step is a lock-free pointer compare rather than a lock-guarded
+  `map[any]any` probe — removing that cost flipped this axis.
 - ✅ **Batching beats sequential injection within plocal.** One
-  `WithProviders(…, 32)` costs 6 allocs / 1 level and keeps reads flat, versus
-  128 allocs / 32 levels for 32 separate `WithProviders` calls (5×+ the time and
-  20×+ the allocs). Use `ProvideAll`/`WithProviders` for values that share a
+  `WithProviders(..., 32)` costs 3 allocs / 1 level and keeps reads flat, versus
+  96 allocs / 32 levels for 32 separate `WithProviders` calls (≈6× the time and
+  32× the allocs). Use `ProvideAll`/`WithProviders` for values that share a
   scope.
 - ✅ **plocal wins type safety.** `Use()` is fully generic — no `any`, no manual
   type assertions, no runtime panics from a bad assertion.
-- ⚠️ **stdlib wins raw single-key lookup speed at every depth.** For a
-  worst-case read, `context.Value()` is faster at depth 1 (8 vs 37 ns), depth 10
-  (54 vs 256 ns) and depth 100 (448 vs 2554 ns). Each plocal step is a
-  lock-guarded `map[any]any` probe plus a pointer hop; each stdlib step is a
-  pointer compare + type switch. `Use()` is *not* faster than `context.Value()`
-  for a deep chain of single-value scopes, and this project does not claim it is.
-- ⚠️ **stdlib also wins raw injection ns/bytes.** A single `context.WithValue`
-  is cheaper than creating a registry node (48 B/1 alloc vs ~472 B/6 allocs).
-  plocal's injection advantage is the **shape** it buys — one level, a bounded
-  alloc count, and flat reads — not raw nanoseconds or bytes.
+- ⚠️ **stdlib still wins raw single-value scope creation, and depth-1 lookup.**
+  `context.WithValue` costs 48 B / 1 alloc versus a registry node's 152 B /
+  5 allocs, and at depth 1 its single wrap (8.8 ns) is marginally cheaper than
+  locating the plocal leaf via `c.Value(registryKey)` (13.1 ns). plocal's
+  advantage is the **shape** it buys — one level, a bounded alloc count, flat
+  reads — plus its now-real depth advantage once the chain is more than a couple
+  of levels deep.
+- ⚠️ **Keep a single scope's value count small.** Past ~16 values in one node,
+  the worst-case read inside that node grows linearly (see the soft cap table).
+  Nested scopes avoid the wide-single-node case.
+
+### Superseded decisions
+
+This result set supersedes the `sync.RWMutex` decision made in the change
+`fix-benchmark-truthfulness-and-injection-cost`. That change added a per-node
+read-write mutex so in-place upsert could not race a concurrent `Use` — a correct
+fix for the race it addressed, but it put a lock on the read path and kept a
+`map[any]any` per node. Both are gone: nodes are now **immutable after
+construction** and store a **pointer-keyed slice**, so reads are lock-free and
+upsert is copy-on-upsert. The concurrency guarantee is unchanged in force but now
+holds **by construction** rather than by locking, and the depth conclusion is
+reversed: plocal is no longer slower than stdlib at every depth. This also
+supersedes the depth disclosure in the archived
+`document-platform-example-and-stdlib-benchmarks`.

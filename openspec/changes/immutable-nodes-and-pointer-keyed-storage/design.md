@@ -205,5 +205,17 @@ Sequencing within the change:
 - Should the width soft cap be enforced (a lint or a test that fails past N) or
   only documented? Current leaning: documented only, since the regression is
   graceful and per-scope counts are a caller choice.
-- Is the `c.Value(registryKey)` floor worth a follow-up change? Depends on the
-  composition measurement described above.
+
+## Follow-up Candidates
+
+Recorded here so they are not lost; **not** implemented by this change.
+
+- **Eliminate or amortize the `c.Value(registryKey)` floor in `Use`.** After this
+  change a depth-1 read is ~13 ns, and `Use` begins by walking the *standard*
+  context chain by interface assertion to locate the leaf node. On a bare
+  `context.Background()` a miss measured ~0.53 ns, but the cost scales with the
+  number of stdlib wrappers (timeouts, cancellations, `net/http` request
+  contexts) between the given context and the node. This is now the largest
+  remaining fixed cost at shallow depth and is worth measuring under realistic
+  `net/http` + `WithTimeout` composition before scoping any work. No decision in
+  this change depends on its outcome.
